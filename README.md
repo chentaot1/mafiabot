@@ -2,7 +2,7 @@
 
 **A Discord social-deduction game with 27 roles, an ordered night-resolution engine, restart recovery, and a Monte Carlo balance-analysis system.**
 
-MafiaBot hosts a Mafia/Town-of-Salem-inspired ruleset for a Discord server: hidden role assignment, private night actions, daytime nominations and trials, faction and personal win conditions, and persistent player statistics. The repository includes the playable bot, a separate simulation of repeated games, and tools that stress-test the actual engine.
+MafiaBot hosts a Mafia/Town-of-Salem-inspired ruleset for a Discord server: hidden role assignment, private night actions, daytime nominations and trials, faction and personal win conditions, and persistent player statistics. The repository includes the Discord bot, a separate simulation of repeated games, and tools that exercise the game engine.
 
 **Python · discord.py · asyncio · SQLite · Monte Carlo simulation · Property-based testing**
 
@@ -22,9 +22,9 @@ Daytime play includes nominations, a timed defense, guilty/innocent judgments, d
 
 The bot creates or reuses game text/voice channels and roles, applies Mafia/graveyard visibility rules, changes voice permissions by phase, and moves dead players to the graveyard voice channel when possible.
 
-## An engine built around interacting abilities
+## Night-action resolution
 
-The difficult part is resolving abilities that change the meaning of other abilities. [`engine/night.py`](engine/night.py) implements an ordered pipeline:
+Abilities can redirect targets, block actions, change investigative results, or affect attack outcomes. [`engine/night.py`](engine/night.py) resolves these interactions through an ordered pipeline:
 
 1. Apply transports and Witch control/redirection.
 2. Build visit records and resolve roleblocking and Gatekeeper guards, including chains, immunities, and repeated-state detection.
@@ -47,7 +47,7 @@ Faction victories and personal victories are tracked separately: a Pirate can me
 
 ## Monte Carlo balance analysis
 
-[`scripts/monte_carlo_sim.py`](scripts/monte_carlo_sim.py) models complete games through repeated day/night cycles and aggregates faction and neutral outcomes. It supports:
+[`scripts/monte_carlo_sim.py`](scripts/monte_carlo_sim.py) simulates games through day/night cycles using modeled player decisions and aggregates faction and neutral outcomes. It supports:
 
 - Reproducible seeded rollouts for a fixed role list.
 - Enumeration of five- and six-player compositions, with per-composition outcome rates and estimated generator frequencies written to CSV.
@@ -63,13 +63,13 @@ python scripts/monte_carlo_sim.py --audit
 python scripts/monte_carlo_sim.py --generator-trials 1000 --player-count 7 --seed 12345 --diagnostics
 ```
 
-## Testing the actual engine
+## Game-engine testing
 
-The repository also tests the real game code with Discord test doubles:
+The repository also tests the game engine with Discord test doubles:
 
-- Deterministic ability/interaction scenarios, randomized night actions, and optional systematic/exhaustive scenarios in [`sim_test.py`](scripts/sim_test.py).
+- Deterministic ability/interaction scenarios, randomized night actions, and optional scenario enumeration in [`sim_test.py`](scripts/sim_test.py).
 - Hypothesis-generated role/action inputs, including malformed targets, in [`property_test.py`](scripts/property_test.py).
-- Dedicated fuzzing for phase transitions, state serialization, member rehydration, persistence files, and tribunals.
+- Fuzzing tools for phase transitions, state serialization, member rehydration, persistence files, and tribunals.
 - Failure capture, replay suites, and minimizers that reduce a generated failure into a smaller reproducible case, coordinated by [`bug_finder.py`](scripts/bug_finder.py).
 - Regression coverage for the database/outbox, restart behavior, private-channel guards, and specific role-interaction bugs, alongside the standalone smoke suite.
 
