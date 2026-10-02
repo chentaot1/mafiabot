@@ -1,0 +1,40 @@
+{
+  "exception": {
+    "message": "'int' object is not iterable",
+    "type": "TypeError"
+  },
+  "iteration": 1,
+  "kind": "state_fuzz",
+  "payload": {
+    "day_number": 0,
+    "doused_players": "oops",
+    "graveyard": [],
+    "guild_id": "123",
+    "in_progress": true,
+    "living_ids": [
+      1,
+      2
+    ],
+    "lockdown_role_id": null,
+    "locked_channel_ids": [
+      1,
+      "2",
+      "x"
+    ],
+    "night_actions": 1,
+    "phase": "day",
+    "player_ids": 5,
+    "player_roles": {
+      "": "true",
+      "2": "",
+      "NaN": ""
+    },
+    "player_slots": null,
+    "role_states": null,
+    "stats_committed": "true",
+    "tribunal_defendant_id": null,
+    "tribunal_muted": 1,
+    "votes_today": "2"
+  },
+  "seed": 940000
+}

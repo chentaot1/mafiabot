@@ -1,0 +1,42 @@
+{
+  "exception": {
+    "message": "'str' object has no attribute 'get'",
+    "type": "AttributeError"
+  },
+  "iteration": 5,
+  "kind": "state_fuzz",
+  "payload": {
+    "day_number": 1,
+    "doused_players": [
+      1,
+      "2",
+      "x"
+    ],
+    "graveyard": "oops",
+    "in_progress": "false",
+    "living_ids": null,
+    "lockdown_role_id": null,
+    "locked_channel_ids": {},
+    "night_actions": {
+      "": -1,
+      "-5": "true",
+      "x": "true"
+    },
+    "phase": null,
+    "player_ids": [],
+    "player_roles": [],
+    "player_slots": {
+      "NaN": {
+        "x": 1
+      }
+    },
+    "role_states": {
+      "": ""
+    },
+    "stats_committed": "true",
+    "tribunal_defendant_id": "x",
+    "tribunal_muted": 1,
+    "votes_today": 1
+  },
+  "seed": 940000
+}

@@ -1,0 +1,45 @@
+{
+  "exception": {
+    "message": "'int' object has no attribute 'items'",
+    "type": "AttributeError"
+  },
+  "iteration": 0,
+  "kind": "state_fuzz",
+  "payload": {
+    "day_number": "2",
+    "doused_players": "oops",
+    "graveyard": null,
+    "guild_id": "123",
+    "in_progress": true,
+    "living_ids": null,
+    "lockdown_role_id": "NaN",
+    "locked_channel_ids": [
+      1,
+      "2",
+      "x"
+    ],
+    "night_actions": 1,
+    "phase": "day",
+    "player_ids": 5,
+    "player_roles": {
+      "": "true",
+      "1": null,
+      "2": "0",
+      "NaN": -1
+    },
+    "player_slots": {
+      "": "NaN",
+      "-5": false,
+      "1": 3.14,
+      "NaN": false
+    },
+    "role_states": {
+      "1": {}
+    },
+    "stats_committed": false,
+    "tribunal_defendant_id": {},
+    "tribunal_muted": 0,
+    "votes_today": 0
+  },
+  "seed": 940000
+}

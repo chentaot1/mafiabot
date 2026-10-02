@@ -1,0 +1,31 @@
+{
+  "exception": {
+    "message": "invalid literal for int() with base 10: 'NaN'",
+    "type": "ValueError"
+  },
+  "iteration": 2,
+  "kind": "state_fuzz",
+  "payload": {
+    "day_number": "NaN",
+    "doused_players": null,
+    "graveyard": [],
+    "guild_id": "NaN",
+    "in_progress": "true",
+    "living_ids": {},
+    "lockdown_role_id": 123,
+    "locked_channel_ids": null,
+    "night_actions": 1,
+    "phase": "",
+    "player_ids": null,
+    "player_roles": {
+      "NaN": ""
+    },
+    "player_slots": null,
+    "role_states": [],
+    "stats_committed": 0,
+    "tribunal_defendant_id": {},
+    "tribunal_muted": true,
+    "votes_today": 0
+  },
+  "seed": 940000
+}

@@ -1,0 +1,26 @@
+{
+  "exception": {
+    "message": "'str' object has no attribute 'get'",
+    "type": "AttributeError"
+  },
+  "iteration": 5,
+  "kind": "rehydrate_fuzz",
+  "payload": {
+    "alive_role_id": 111,
+    "day_number": "2",
+    "graveyard": "oops",
+    "guild_id": null,
+    "in_progress": "false",
+    "living_ids": null,
+    "night_actions": null,
+    "phase": "day",
+    "player_ids": [],
+    "player_roles": {
+      "1": "Doctor",
+      "2": "Mobster",
+      "x": "Townie"
+    },
+    "role_states": 1
+  },
+  "seed": 1
+}
