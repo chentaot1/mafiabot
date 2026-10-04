@@ -119,3 +119,13 @@ python scripts/sim_test.py --skip-exhaustive --fuzz-iterations 200 --seed 12345
 ```
 
 Tokens, live server state, databases, logs, and generated simulation reports are excluded from Git. The retained replay fixtures are synthetic; inspect newly generated failures before publishing them.
+
+## License
+
+Copyright (c) 2026 chentaot1.
+
+MafiaBot's original source code and documentation are licensed under the [GNU Affero General Public License, version 3](LICENSE) (`AGPL-3.0-only`). You may redistribute and modify them under that license. The software is provided without warranty, including any implied warranty of merchantability or fitness for a particular purpose.
+
+Commercial use is permitted under the license. If you run a modified version that users interact with over a network, you must prominently offer those users access to the corresponding source code of that version, as required by section 13. For a Discord deployment, provide an accessible source link or command that points to the source of the version you actually run, including your modifications.
+
+Third-party dependencies and any third-party material retain their own licenses and terms; this license grants no rights to material owned by others.
