@@ -4,7 +4,7 @@ The project has two different kinds of simulation. They answer different questio
 
 ## Balance modeling
 
-[`scripts/monte_carlo_sim.py`](../scripts/monte_carlo_sim.py) implements a separate model of repeated games. It samples roles and player decisions, advances games through day/night cycles, and aggregates faction and neutral outcomes.
+[`scripts/monte_carlo_sim.py`](../scripts/monte_carlo_sim.py) exposes the modular simulator in [`scripts/monte_carlo`](../scripts/monte_carlo). It samples rosters and modeled player decisions, advances day/night cycles, and aggregates faction and personal outcomes. Its bridge executes the production night pipeline with headless members/guilds. The default generator and several win/death helpers are shared with the bot.
 
 It supports:
 
@@ -19,7 +19,7 @@ For a quick reproducible run:
 
 ```powershell
 python scripts/monte_carlo_sim.py --audit
-python scripts/monte_carlo_sim.py --generator-trials 1000 --player-count 7 --seed 12345 --diagnostics
+python scripts/monte_carlo_sim.py --generator-trials 1000 --player-count 7 --workers 2 --seed 12345 --diagnostics
 ```
 
 To inspect sampled lobby composition instead of outcomes:
@@ -36,7 +36,9 @@ python scripts/monte_carlo_sim.py --enumerate 5 --n-per 100 --seed 12345 --out-c
 
 Enumeration can take considerably longer than a single sampled run. Generated reports are ignored by Git. Historical results are not included in this publication.
 
-**Interpretation:** Results depend on the modeled decisions, role-selection constraints, and difficulty assumptions. Neutral wins can coexist with other outcomes, so every printed probability is not part of one mutually exclusive distribution. Matching role pools does not prove the simulator and live engine implement identical semantics. Use estimates to identify configurations worth testing with people and to compare experiments under consistent assumptions.
+**Interpretation:** Results depend on modeled decisions, role-selection constraints, and competence assumptions. Competence has targeting, resource-use, and daytime axes; use `--show-competence` to inspect it. Neutral wins can coexist with other outcomes, so every printed probability is not part of one mutually exclusive distribution. Night-engine reuse reduces duplicated resolution logic, but daytime decisions and the headless adapter still have separate assumptions. Use estimates to identify configurations worth testing with people, rather than treating them as measurements of human behavior.
+
+Generator trials support process workers; use an explicit `--workers 2` for a bounded run or `--serial` for one process. Automatic sizing uses CPU count, capped by the number of trials. Fixed-lineup and enumeration modes have their own runtime paths; do not assume every command benefits from the worker option. Large enumerations and systematic interaction sweeps can be expensive even with parallelism.
 
 ## Actual engine checks
 
@@ -52,7 +54,7 @@ The fuzzing tools also cover phase changes, state serialization, rehydration, pe
 
 ## Regression tests and publication limits
 
-`python -m pytest -ra` exercises database/outbox behavior, restart handling, channel guards, role interactions, the smoke suite, and retained replay fixtures. New configuration tests verify that fresh installations have no built-in server/player IDs and reject invalid local settings before connecting.
+`python scripts/run_bounded_tests.py -o addopts= -ra` runs all pytest cases while capping automatic pool sizing to two logical CPUs in the launcher. Tests that explicitly select or mock worker counts still exercise those contracts. Coverage includes database/outbox behavior, restart handling, private controls, concurrent persistence, restored-role integration, engine invariants, and replay fixtures. Fresh installations have no built-in server/player IDs and reject invalid settings before connecting.
 
 Only synthetic fixtures free of the original server's identifiers are included. Missing fixture collections appear as skipped pytest parameter sets. New fuzz failures can contain state or identifiers from their inputs: inspect any generated repro before committing it.
 

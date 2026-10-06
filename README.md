@@ -1,10 +1,10 @@
 # MafiaBot
 
-**A Discord social-deduction game with 27 roles, an ordered night-resolution engine, persistent match history, restart recovery, and a Monte Carlo balance-analysis system.**
+**A Discord social-deduction game with 32 roles, an ordered night-resolution engine, persistent match history, restart recovery, and a Monte Carlo balance-analysis system.**
 
 MafiaBot hosts a Mafia/Town-of-Salem-inspired ruleset for a Discord server. Players receive hidden roles, submit private night actions, and discuss their suspicions during the day. An overseer runs the game while the bot handles role interactions, nominations and trials, deaths, faction outcomes, and personal objectives.
 
-The repository includes the playable Discord bot and its rules engine, a separate model for repeated-game balance experiments, and regression, property-testing, fuzzing, replay, and minimization tools. The implementation was developed with AI assistance under the author's direction and review.
+The repository includes the playable Discord bot and its rules engine, an engine-backed model for repeated-game balance experiments, and regression, property-testing, fuzzing, replay, and minimization tools. The implementation was developed with AI assistance under the author's direction and review.
 
 **Python · discord.py · asyncio · SQLite · Monte Carlo simulation · Hypothesis**
 
@@ -30,7 +30,9 @@ The Discord command layer translates player input into game state and submitted 
 
 ```mermaid
 flowchart TD
-    Players["Discord players and overseer"] --> Bot["bot.py: commands, trials, duels"]
+    Players["Discord players and overseer"] --> Bot["bot.py: Discord commands"]
+    Bot --> Controls["gameplay/: private controls, trials, duels"]
+    Controls --> Game
     Bot --> Game["game.py: state, lifecycle, wins"]
     Game --> Engine["engine/night.py: ordered night resolution"]
     Game --> Snapshots["persistence.py: JSON snapshots"]
@@ -38,20 +40,22 @@ flowchart TD
     Bot --> Outbox["SQLite role-message outbox"]
     Checks["Engine scenarios, properties, fuzzing"] --> Game
     Checks --> Engine
-    Model["Separate Monte Carlo game model"] --> Reports["Outcome estimates, CSV, diagnostics"]
+    Model["Monte Carlo: modeled players and day decisions"] --> Bridge["Bridge to production night engine"]
+    Bridge --> Engine
+    Model --> Reports["Outcome estimates, CSV, diagnostics"]
     Config["Role pools and selection assumptions"] -.-> Bot
     Config -.-> Model
 ```
 
-Two verification paths serve different purposes. The engine harness exercises game components with Discord test doubles and checks specific behavior. The Monte Carlo simulator implements its own decisions and resolution model to estimate outcomes across repeated games. Its role-pool audit checks configuration coverage; it does not establish semantic equivalence with the live engine.
+Two verification paths serve different purposes. The engine harness exercises game components with Discord test doubles and checks specific behavior. The Monte Carlo simulator samples modeled player decisions and uses the production night pipeline through a headless bridge. Lobby generation and several win/death helpers are shared too. Daytime behavior and player decisions still contain separate assumptions; sharing the night engine does not make the simulated matches equivalent to human play.
 
 ## Role roster and lobby generation
 
-The configured roster contains **12 Town, 8 Mafia, and 7 neutral roles**. Commands below use stable seat numbers assigned at game start; seats remain unchanged when players die. Full rules, targeting restrictions, and strategy notes are in the [player guide](MAFIA_GAME_GUIDE.md).
+The configured roster contains **15 Town, 8 Mafia, and 9 neutral roles**. Commands below use stable seat numbers assigned at game start; seats remain unchanged when players die. Full rules, targeting restrictions, and strategy notes are in the [player guide](MAFIA_GAME_GUIDE.md).
 
 ### Town
 
-- **Retributionist** — `!corpses`, `!reanimate`: use an eligible dead Town player's ability. Two uses; a corpse can be used once, and hidden corpses are unavailable. A Transporter corpse requires two targets.
+- **Retributionist** — `!corpses`, `!reanimate`: use an eligible dead Town player's ability. One use through seven players, two above seven; a corpse can be used once, and hidden corpses are unavailable. A Transporter corpse requires two targets.
 - **Doctor** — `!heal`: protect a player, with one self-heal per game. A revealed Mayor cannot be healed.
 - **Sheriff** — `!investigate`: receive an innocent/suspicious result. Framing and dousing can make a target appear suspicious.
 - **Investigator** — `!investigate`: receive a bucket of possible roles rather than a single exact identity.
@@ -60,9 +64,13 @@ The configured roster contains **12 Town, 8 Mafia, and 7 neutral roles**. Comman
 - **Escort** — `!roleblock`: prevent a target's night action, subject to immunity and interaction rules.
 - **Vigilante** — `!shoot`: one bullet. Killing a Town member triggers delayed guilt.
 - **Bodyguard** — `!protect`: one off-self protection and one self-protection. A successful interception can kill the attacker and the Bodyguard.
-- **Scary Grandma** — `!alert`: two alerts, attacking visitors while on guard.
+- **Scary Grandma** — `!alert`: one alert through seven players, two above seven, attacking visitors while on guard.
 - **Transporter** — `!transport`: swap two players' destinations, changing where other abilities land.
 - **Mayor** — `!reveal`: publicly reveal during the day to receive double vote weight.
+
+- **Psychic** — passive visions after resolution: odd nights name three slots containing an evil player; even nights name two qualifying good players. Blocking, small survivor counts, and Witch control affect delivery.
+- **Deputy** — daytime `!shoot` from Day 2: one bullet per Deputy for the entire game. A mistaken shot kills the target and the Deputy.
+- **Seer** — `!gaze`: compare two other players as Friends or Enemies using alignment buckets. Cannot repeat an unordered pair or gaze a revealed Mayor.
 
 ### Mafia
 
@@ -73,25 +81,28 @@ The configured roster contains **12 Town, 8 Mafia, and 7 neutral roles**. Comman
 - **Hypnotist** — `!hypnotize`: send fake healed, roleblocked, transported, controlled, or attacked feedback.
 - **Mole** — `!investigate`: one exact-role investigation.
 - **Tailor** — `!tailor`: one use to substitute a false role in a death reveal.
-- **Gatekeeper** — `!guard`: two uses to block non-Mafia visitors to a guarded house, with specific immunity and blocking-chain rules.
+- **Gatekeeper** — `!guard`: one use through seven players, two above seven, to block non-Mafia visitors to a non-Mafia guarded house. Cannot self-guard or successfully guard the same effective target on consecutive nights.
 
 ### Neutral
 
 - **Executioner** — get an assigned Town target lynched. A target killed at night can cause conversion to Jester.
 - **Jester** — win by being lynched; afterward, `!haunt` an eligible guilty or abstaining voter.
-- **Survivor** — survive to the end; `!vest` provides temporary defense, with two vests.
+- **Survivor** — survive to the end; `!vest` provides temporary defense, with one vest through seven players and two above seven.
 - **Witch** — survive to see Town lose; `!control` forces one player's action toward another and reveals the controlled player's role.
 - **Pirate** — `!plunder` initiates a private duel and blocks the target. Successful plunder contributes toward a personal objective.
 - **Arsonist** — `!douse`, `!clean`, `!ignite`: build a doused-player set, remove gasoline from yourself, or ignite doused players through ordinary defenses.
-- **Chaos** — survive to the end; two uses of `!chaos` introduce a random effect involving two targets.
+- **Chaos** — survive to the end; one use through seven players, two above seven, of `!chaos` introduces a random non-killing effect involving two targets.
+
+- **Guardian Angel** — assigned a bound player; `!ward` has one charge, clears their douse, grants invincible night protection, and prevents next-day nomination. A dead Guardian Angel can still ward astrally; personal victory requires surviving and qualifying under the shared win rules.
+- **Serial Killer** — `!stab` gives a nightly basic attack; `!cautious` toggles retaliation against ordinary roleblockers. Has basic defense and roleblock immunity, with separate Pirate interactions.
 
 ### Size-dependent composition
 
-Games require at least five players. Five- and six-player games draw from a narrower Town/Mafia pool and use Jester, Executioner, or Survivor as the neutral. Larger lobbies introduce the remaining roles.
+Games require at least five players. The live start command and default simulator draw from the same [`game_roles.py`](game_roles.py) generator.
 
-The generator assigns one Mafia and one neutral at five or six players; two Mafia and one neutral at seven through nine; three Mafia and two neutrals at ten through twelve; and four Mafia and two neutrals above twelve. Remaining slots are Town. The actual start command checks that the available unique roles fill the requested roster.
+Five players receive one Town Investigative, one Town Protective, two Random Town slots, and one Mobster, with no neutral. Six players add one neutral; seven add two neutrals from distinct buckets. From eight players onward, the generator draws weighted Town and Mafia support pools: eight/nine have two Mafia and one neutral; ten through twelve have three Mafia and two neutrals; larger lobbies have four Mafia and two neutrals. Remaining slots are Town.
 
-Town and Mafia support roles are sampled **without replacement using weights**, so a game does not simply choose every role uniformly. Larger-lobby neutrals also have composition constraints: at most one Arsonist/Pirate and at most one Witch/Executioner. Witch receives an additional frequency reduction. These policies are implemented in [`bot.py`](bot.py); the simulator provides experiments against comparable selection assumptions.
+Repeated roles are allowed except Mayor, Scary Grandma, Retributionist, Mobster, Pirate, Arsonist, and Guardian Angel. Neutral slots select distinct benign/evil/killing/chaotic buckets, then a weighted role within each chosen bucket. The small-lobby manifests and larger flat pools are documented in [`game_roles_tos.py`](game_roles_tos.py) and `game_roles.py`.
 
 ## Game lifecycle and player controls
 
@@ -113,6 +124,8 @@ The overseer uses `!night`, `!resolve`, and `!day` to advance play. These contro
 ### Private actions and stable targeting
 
 Night actions can be submitted through prefix commands in DMs or configured private player channels. Supported hybrid commands also offer slash-command target autocomplete in the server. Public-channel submissions are rejected to reduce accidental disclosure of hidden actions. Submitting another valid action replaces the previous selection before resolution.
+
+`/actions` opens private Components V2 controls with role-specific abilities, paged targets, explicit submission, and optional corpse/message choices. Commands and components share validation and payload construction; stale panels cannot submit into a later phase.
 
 Target autocomplete is built from living players and stable seat numbers. Commands validate such conditions as phase, living status, role ownership, target eligibility, and remaining charges. Restrictions differ by ability: a Doctor's self-heal is limited, a Framer acts only on early nights, and a Retributionist chooses from a numbered eligible-corpse list.
 
@@ -145,7 +158,7 @@ Transport resolves before Witch control. Visit records are then built from the r
 
 Blocking is a dependency problem: a blocked roleblocker should not apply its block, and a blocked Gatekeeper should not maintain a guard. `_compute_blocked_sets` evaluates ordinary roleblocks and guarded-house effects together. It tracks repeated states and bounds its outer passes, avoiding an unbounded loop when interactions cycle.
 
-The engine distinguishes raw visit records used during blocking from the effective records after blocked actors are removed. Lookout, Tracker, alert interactions, and later resolution consume the appropriate resulting state. Chaos can introduce a new roleblock, transport, guard, protection, or information effect; visits and blocking are rebuilt afterward so subsequent stages see the changed actions.
+The engine distinguishes raw visit records used during blocking from the effective records after blocked actors are removed. Lookout, Tracker, alert interactions, and later resolution consume the appropriate resulting state. Chaos can introduce a new roleblock, transport, guard, or information effect; visits and blocking are rebuilt afterward so subsequent stages see the changed actions.
 
 ### Protection, information, and combat
 
@@ -163,28 +176,28 @@ Faction victories and personal victories are recorded separately. A neutral obje
 
 ### Daytime tribunal
 
-The overseer starts a tribunal with `!vote`. The live implementation uses **Discord reaction polls**, with up to two trials per day.
+The overseer starts a tribunal with `!vote`, with up to two trials per day. Components V2 controls collect nominations and judgments; changing a choice updates that player's saved ballot.
 
-1. **Nomination — 300 seconds:** living players react to nominate a player. Multiple nominee reactions invalidate that player's nomination. A unique positive leader advances; a tie or no votes produces no defendant.
-2. **Defense — 45 seconds:** the defendant receives the stand role, while the bot adjusts voice permissions so the defendant can speak.
-3. **Judgment — 30 seconds:** eligible living players react Guilty or Innocent. Reacting to both counts as abstention; the defendant cannot judge their own case. A revealed Mayor's vote counts twice.
-4. **Verdict:** guilty must exceed innocent. A guilty result processes the lynch, applies relevant personal objectives and Jester eligibility, checks the game outcome, and starts night if the game continues. A tie spares the defendant.
+1. **Nomination — 300 seconds:** living players choose another eligible living player or abstain. A unique positive leader advances; a tie or no votes produces no defendant. Guardian Angel protection prevents nomination.
+2. **Defense — 45 seconds:** the defendant receives the stand role, while voice permissions let the defendant speak.
+3. **Judgment — 30 seconds:** eligible players select Guilty, Innocent, or Abstain. The defendant cannot judge their own case; a revealed Mayor's vote counts twice.
+4. **Verdict:** the committed result proceeds to death handling and phase advancement. Guilty must exceed innocent; ties spare the defendant.
 
-Tribunal state retains the defendant, subphase, UTC deadlines, judgment-message reference, mute state, trial count, and a verdict-commit guard. Startup can resume a valid defense with enough remaining time. Invalid or overdue trials are aborted and permissions repaired; recovery is deliberately narrower than resuming every point of a trial.
+Votes, UTC deadlines, stage tokens, results, and completion receipts survive restarts. The controller reconstructs modern trial views, repairs voice permissions, and resumes pending delivery. Old snapshots without modern control records receive compatibility handling; this does not promise resumption of every historical UI state.
 
 ### Pirate duels
 
-`!plunder` opens private attacker and defender selection controls with a 30-second timeout. The command records the result as a pending night action. Night resolution checks unfinished duels before proceeding, so a phase transition does not race an unresolved choice. Winning the choice interaction and completing an effective plunder are distinct steps: another ability can prevent the final visit or kill.
+`!plunder` opens private selection controls with a 30-second timeout. Both choices, deadlines, tokens, prompts, and results are persisted. Restart recovery resumes modern duels; incomplete legacy actions without recoverable choices/deadlines are closed rather than invented. Resolution waits for unfinished duels. Winning the choice interaction and killing the target are distinct: other abilities can prevent the final kill, and Pirate's objective requires two effective plunder kills.
 
 ## Monte Carlo balance analysis
 
-[`scripts/monte_carlo_sim.py`](scripts/monte_carlo_sim.py) is a repeated-game model covering day/night cycles, role decisions, investigative evidence, attacks and defenses, resource use, and neutral objectives. It estimates how a configuration behaves under specified player assumptions, rather than ranking role names in isolation.
+[`scripts/monte_carlo_sim.py`](scripts/monte_carlo_sim.py) is the CLI for a modular repeated-game model covering day/night cycles, role decisions, investigative evidence, attacks and defenses, resource use, and neutral objectives. It estimates how a configuration behaves under specified player assumptions, rather than ranking role names in isolation.
 
 ### Fixed compositions and reproducible sweeps
 
 For a chosen role list, the simulator repeatedly samples decisions and outcomes. `--roles`, `--n`, and `--seed` control the composition, rollout count, and random seed. The default fixed-list run uses 20,000 rollouts; smaller counts are useful while checking an experiment's setup.
 
-Five- and six-player enumeration explores the eligible Town combinations with a Mobster and one small-lobby neutral. Without additional constraints, this produces **168 five-player compositions** and **210 six-player compositions**. `--n-per` controls the rollouts for every composition; its default is 1,000.
+Five- and six-player enumeration explores supported small-lobby manifests and constraints. Counts depend on the selected generator and filters. `--n-per` controls rollouts per composition and defaults to 1,000; enumeration is a larger experiment than a small sampled batch.
 
 Enumeration derives each composition's seed from the base seed and a BLAKE2b digest of its sorted role list. This makes a composition's seed stable across processes, rather than relying on Python's randomized string hash. The sweep produces a CSV with role lists, rollout counts, estimated generator frequency, and outcome rates.
 
@@ -192,13 +205,13 @@ Enumeration derives each composition's seed from the base seed and a BLAKE2b dig
 
 Two compositions with similar strength can occur at very different frequencies under the live-style weighted generator. The enumeration report therefore calculates both a simple average across compositions and an average weighted by their estimated generation probabilities.
 
-Those frequencies are estimated in a separate sampling pass: **200,000 roster draws for five-player enumeration and 300,000 for six-player enumeration**. These are composition draws, not additional simulated full games. The report also identifies compositions with high and low modeled Town outcomes.
+Generator frequencies are estimated in a separate roster-sampling pass rather than counted as extra simulated games. The report distinguishes pooled outcomes from averages across composition or worker chunks and includes the relevant denominators.
 
 For larger-lobby experiments, `--generator-trials` repeatedly samples rosters and plays them through the model. `--generator-distribution` instead measures role appearance rates and common compositions without simulating gameplay. This separates selection-policy effects from decisions during a match.
 
 ### Player competence and evidence
 
-Role-specific baseline competence probabilities range from 0.45 to 0.75. At supported decision points, the model chooses between a heuristic action and a random legal alternative. `--lobby-skill` shifts these probabilities by up to 0.10 in either direction while retaining relative role difficulty. `--no-difficulty` selects the competent branch at those points; it does not turn the model into an optimal solver.
+The competence model has separate targeting, resource-usage, and daytime axes for each role. A lobby skill setting and role-specific difficulty determine the probability of taking a heuristic action instead of a legal random alternative. `--show-competence` exposes these assumptions; `--no-difficulty` chooses the heuristic branch at supported decision points. It does not turn the simulator into an optimal solver.
 
 The day model accumulates investigative evidence and uses living Town competence when choosing a lynch. Night heuristics include role-dependent targeting and resource timing. These are explicit modeling assumptions, not measured estimates of how human players behave.
 
@@ -214,8 +227,8 @@ Run the role audit, inspect the generated distribution, then estimate outcomes u
 
 ```powershell
 python scripts/monte_carlo_sim.py --audit
-python scripts/monte_carlo_sim.py --generator-trials 1000 --player-count 7 --seed 12345 --generator-distribution
-python scripts/monte_carlo_sim.py --generator-trials 1000 --player-count 7 --seed 12345 --diagnostics
+python scripts/monte_carlo_sim.py --workers 2 --generator-trials 1000 --player-count 7 --seed 12345 --generator-distribution
+python scripts/monte_carlo_sim.py --workers 2 --generator-trials 1000 --player-count 7 --seed 12345 --diagnostics
 ```
 
 For a composition sweep:
@@ -224,7 +237,7 @@ For a composition sweep:
 python scripts/monte_carlo_sim.py --enumerate 5 --n-per 100 --seed 12345 --out-csv scripts/monte_carlo_5p.csv
 ```
 
-The simulator runs serially in this repository. Large enumerations take longer than a single sampled experiment. Reports are generated locally and excluded from Git; this publication does not include historical result datasets or performance claims.
+Generator trials support process parallelism through `--workers`; `--serial` or `--workers 1` provides a serial run. Workers are capped by trial count and aggregate seeded chunks; default sizing uses available CPU count. Use an explicit count for bounded local runs. Large enumerations take longer than a sampled experiment. Reports are generated locally and excluded from Git; this publication does not include historical result datasets or performance claims.
 
 Results depend on the decisions and resolution rules in this separate model. Neutral successes can overlap with faction outcomes, and finite samples have sampling uncertainty. Use consistent assumptions and multiple seeds when comparing changes, then validate promising configurations through engine checks and human playtesting. Increasing trial count reduces sampling noise; it does not remove model mismatch.
 
@@ -252,7 +265,7 @@ Retained replay fixtures are synthetic. Some replay collections are empty and ap
 
 ### CI and validation scope
 
-[Windows/Python 3.12 CI](.github/workflows/tests.yml) runs pytest, the standalone smoke suite, 200 seeded engine iterations, and the simulator role audit on pushes and pull requests. The publication checks passed **49 pytest tests, with four skipped empty replay collections**, alongside those bounded checks. This describes the published snapshot's checks, not every optional large experiment.
+[Windows/Python 3.12 CI](.github/workflows/tests.yml) runs the bounded pytest launcher, the standalone smoke suite, 200 seeded engine iterations, and the simulator role audit on pushes and pull requests. The October 6, 2026 integration checks passed **257 pytest tests, with four skipped empty replay collections**, plus the standalone smoke suite, 47 engine scenarios with 200 seeded fuzz iterations, the 32-role audit, 50 generated matches with two workers, and 10 fixed-lineup matches including all five restored roles. This describes the published snapshot's checks, not every optional large experiment.
 
 Regression coverage includes database/outbox behavior, restart recovery, private-channel guards, configuration validation, and specific role interactions. Larger fuzzing and property runs are available separately; consult each script's `--help` and the [simulation guide](docs/SIMULATION.md).
 
@@ -280,7 +293,7 @@ The bot includes a single-instance lock, gateway monitoring, reconnect handling,
 
 SQLite stores matches and participant records alongside aggregate and per-role statistics. Participant records preserve starting-role information even if a player is promoted or converted, while faction outcomes and personal wins are tracked separately.
 
-`!stats` provides a player summary. `/leaderboard` opens selectable views for overall wins, faction wins, personal objectives, and win rate; the win-rate query applies a minimum-games threshold. An overseer import command supports legacy JSON statistics.
+`!stats` provides a player summary. `/leaderboard` opens selectable views for overall wins, faction wins, personal objectives, and win rate; the win-rate query applies a minimum-games threshold. Legacy JSON statistics can be imported through the overseer command.
 
 The database uses a unique durable game key to identify a committed match and avoid adding the same match twice. History supports aggregate analysis and player progress; this repository does not provide a complete action-by-action match replay interface.
 
@@ -320,7 +333,7 @@ Gather at least five players with `!join`, then use the configured overseer acco
 
 ```powershell
 python -m pip install -r requirements-dev.txt
-python -m pytest -ra
+python scripts/run_bounded_tests.py -o addopts= -ra
 python smoke_test.py
 python scripts/sim_test.py --skip-exhaustive --fuzz-iterations 200 --seed 12345
 python scripts/monte_carlo_sim.py --audit
@@ -338,7 +351,11 @@ Tokens, live server state, databases, logs, and generated simulation reports are
 - [`checks.py`](checks.py): allowed-guild and action-channel checks.
 - [`database.py`](database.py): SQLite match history, aggregate statistics, and durable DM outbox.
 - [`persistence.py`](persistence.py): JSON snapshot and legacy-stat storage.
-- [`scripts/monte_carlo_sim.py`](scripts/monte_carlo_sim.py): separate balance model, sampling, enumeration, and reporting.
+- [`gameplay`](gameplay): shared action submissions, private views, persistent trials/duels, buffered resolution, and guarded state commits.
+- [`game_roles.py`](game_roles.py), [`game_roles_tos.py`](game_roles_tos.py): weighted roster generation and small-lobby manifests.
+- [`scripts/monte_carlo`](scripts/monte_carlo): simulation decisions, bridge to the production night engine, parallel sampling, enumeration, and reporting.
+- [`scripts/monte_carlo_sim.py`](scripts/monte_carlo_sim.py): backward-compatible simulation CLI.
+- [`docs/INTEGRATION.md`](docs/INTEGRATION.md): recovered-source provenance, integration choices, and validation limits.
 - [`scripts`](scripts), [`tests`](tests), [`invariants.py`](invariants.py), [`smoke_test.py`](smoke_test.py): engine scenarios, fuzzing, properties, failure reproduction, and regression checks.
 
 ## License

@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import argparse
+import hashlib
 import itertools
 import json
+import math
 import copy
 import random
 import sys
+import traceback
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
@@ -20,7 +24,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from game import Game
-from scripts import monte_carlo_sim as mcs
+import game_roles
+from scripts.monte_carlo import generator as mc_gen
+from scripts.monte_carlo.runtime import default_trial_workers
 import config as bot_config
 from invariants import (
     assert_game_runtime_sanity as _assert_game_runtime_sanity,
@@ -63,7 +69,7 @@ class FakeChannel:
     messages: List[str] = field(default_factory=list)
     guild: Optional["FakeGuild"] = None
 
-    async def send(self, content: str) -> None:
+    async def send(self, content: str, **kwargs) -> None:
         self.messages.append(str(content))
 
 
@@ -98,39 +104,37 @@ async def run_night_pipeline(game: Game, guild: FakeGuild) -> Dict[str, Any]:
     Executes the same engine pipeline used by `!resolve`, but without any channel I/O.
     Returns a small dict of intermediate artifacts for assertions/debugging.
     """
-    # Optional: emulate the bot's reanimate expansion (keeps this sim closer to real resolve()).
-    _expand_reanimate_actions(game)
+    from engine.night import run_night_pipeline as engine_run_night_pipeline
 
-    await game._resolve_transports(guild)  # type: ignore[arg-type]
-    night_actions_after_transports = copy.deepcopy(game.night_actions)
+    from reanimate_expand import expand_reanimate_actions
 
-    await game._resolve_control(guild)  # type: ignore[arg-type]
-    night_actions_after_control = copy.deepcopy(game.night_actions)
-
+    expand_reanimate_actions(game, strict=True)
+    visit_log, blocked, healed_by_map, protected_by_map, deaths = await engine_run_night_pipeline(
+        game, guild  # type: ignore[arg-type]
+    )
+    blocked_list = list(blocked)
+    blocked_set = set(blocked_list)
     visit_log_raw = game._build_visit_log()
-    blocked = game._resolve_blocking(visit_log_raw)
-    visit_log = {t_id: [v_id for v_id in visitors if v_id not in blocked] for t_id, visitors in visit_log_raw.items()}
-
-    healed_by_map, protected_by_map = await game._apply_misc_actions(blocked, guild)  # type: ignore[arg-type]
-    await game._resolve_investigative(blocked, visit_log, guild)  # type: ignore[arg-type]
-    deaths = await game._resolve_killing(visit_log, blocked, healed_by_map, protected_by_map, guild)  # type: ignore[arg-type]
-    await game._send_night_feedback(blocked, guild)  # type: ignore[arg-type]
-
     return {
         "visit_log_raw": visit_log_raw,
         "visit_log": visit_log,
-        "blocked": blocked,
+        "blocked": blocked_list,
         "healed_by_map": healed_by_map,
         "protected_by_map": protected_by_map,
         "deaths": set(deaths),
-        "night_actions_after_transports": night_actions_after_transports,
-        "night_actions_after_control": night_actions_after_control,
+        "night_transport_swaps": list(getattr(game, "night_transport_swaps", []) or []),
     }
+
+
+async def _sim_noop_persist_flush(self: Game) -> None:
+    """Sim runs must not write ``state/{guild_id}.json`` (parallel + Windows file locks)."""
+    return
 
 
 def make_game(*, seed: int = 1, n: int = 8) -> tuple[Game, FakeGuild, Dict[int, FakeMember]]:
     random.seed(seed)
-    guild_id = 123
+    # Unique guild per seed so parallel systematic workers do not collide on disk.
+    guild_id = 10_000 + (int(seed) % 890_000)
 
     members: Dict[int, FakeMember] = {i: FakeMember(i, f"P{i}") for i in range(1, n + 1)}
     guild = FakeGuild(guild_id, members)
@@ -138,6 +142,8 @@ def make_game(*, seed: int = 1, n: int = 8) -> tuple[Game, FakeGuild, Dict[int, 
         m.guild = guild
 
     game = Game(guild_id)
+    game.game_key = f"sim:{guild_id}"
+    game.persist_flush = _sim_noop_persist_flush.__get__(game, Game)  # type: ignore[method-assign]
     game.in_progress = True
     game.phase = "night"
     # Keep role drift repair logic disabled for sims.
@@ -156,101 +162,109 @@ def make_game(*, seed: int = 1, n: int = 8) -> tuple[Game, FakeGuild, Dict[int, 
     return game, guild, members
 
 
+from per_night_state import all_keys_cleared_at_start_night
+
+# Ephemeral per-night flags cleared by Game.start_night (mirrored for sim resets).
+_NIGHT_EPHEMERAL_ROLE_STATE_KEYS: Tuple[str, ...] = all_keys_cleared_at_start_night()
+
+_VARIANT_LIST_CACHE: Dict[str, List[Dict[str, Any]]] = {}
+
+
+def reset_night_game_state(
+    game: Game,
+    *,
+    members: Dict[int, FakeMember],
+    roles_by_seat: Dict[int, str],
+    day_number: int = 1,
+    clear_member_inboxes: bool = False,
+) -> None:
+    """
+    Restore a fresh night-1 sandbox on an existing Game (all seats alive, counters re-init).
+    Use between sim nights so deaths/douses/visits do not bleed across scenarios.
+    """
+    game.in_progress = True
+    game.phase = "night"
+    game.day_number = int(day_number)
+    game.players = list(members.values())  # type: ignore[assignment]
+    game.living_players = list(members.values())  # type: ignore[assignment]
+    game.player_roles = dict(roles_by_seat)
+    game.night_actions = {}
+    game.graveyard = []
+    game.doused_players.clear()
+    game.night_death_causes.clear()
+    game.night_completion_snapshot = None
+    game.psychic_visions_delivered_this_night = False
+    game.night_transport_swaps = []
+    game._transport_pairs_seen = set()
+    game._effective_visit_destinations_cache = None
+
+    for seat, role in roles_by_seat.items():
+        st = dict(_init_state_for_role(role))
+        for key in _NIGHT_EPHEMERAL_ROLE_STATE_KEYS:
+            st.pop(key, None)
+        game.role_states[int(seat)] = st
+
+    if clear_member_inboxes:
+        for m in members.values():
+            m.inbox.clear()
+
+
+def _variants_for_role(role: str) -> List[Dict[str, Any]]:
+    cached = _VARIANT_LIST_CACHE.get(role)
+    if cached is not None:
+        return cached
+    variants = (
+        [{"type": "noop"}]
+        + _systematic_variants_for_role(role)
+        + _corruption_variants_for_role(role)
+    )
+    _VARIANT_LIST_CACHE[role] = variants
+    return variants
+
+
+def _canonical_night_actions_key(actions: Dict[int, Dict[str, Any]]) -> str:
+    def _norm_obj(obj: Any) -> Any:
+        if isinstance(obj, dict):
+            return {str(k): _norm_obj(v) for k, v in sorted(obj.items(), key=lambda kv: str(kv[0]))}
+        if isinstance(obj, (list, tuple)):
+            return [_norm_obj(x) for x in obj]
+        return obj
+
+    payload = {str(k): _norm_obj(v) for k, v in sorted(actions.items(), key=lambda kv: int(kv[0]))}
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _materialize_combo_seed(
+    base_seed: int,
+    roleset_index: int,
+    seat_combo: Tuple[int, ...],
+    variants: Tuple[Dict[str, Any], ...],
+) -> int:
+    blob = json.dumps([list(seat_combo), *variants], sort_keys=True, default=str)
+    digest = int(hashlib.md5(blob.encode("utf-8")).hexdigest()[:8], 16)
+    seat_mix = 0
+    for sid in seat_combo:
+        seat_mix = seat_mix * 1_009 + int(sid)
+    return (
+        int(base_seed)
+        + int(roleset_index) * 1_000_003
+        + seat_mix * 10_007
+        + digest
+    ) & 0x7FFFFFFF
+
+
+@dataclass
+class SystematicRunStats:
+    nights_executed: int = 0
+    nights_deduped: int = 0
+
+
 def assert_invariants(game: Game) -> None:
     _assert_game_runtime_sanity(game)
 
 
 def assert_post_night_invariants(game: Game, out: Dict[str, Any]) -> None:
     _assert_post_night_pipeline_invariants(game, out)
-
-
-def _expand_reanimate_actions(game: Game) -> None:
-    """
-    Mirror the bot's `!resolve` pre-pass that expands Retributionist `reanimate` into
-    concrete action types consumed by the night engine.
-    """
-    SUPPORTED_RETRI_ROLES = {
-        "Doctor",
-        "Sheriff",
-        "Investigator",
-        "Lookout",
-        "Tracker",
-        "Escort",
-        "Transporter",
-        "Bodyguard",
-        "Vigilante",
-    }
-
-    for actor_id, action in list(game.night_actions.items()):
-        if action.get("type") != "reanimate":
-            continue
-        corpse_role = action.get("corpse_role")
-        if corpse_role not in SUPPORTED_RETRI_ROLES:
-            raise AssertionError(f"_expand_reanimate_actions: unhandled corpse role {corpse_role!r}")
-        if corpse_role == "Doctor":
-            game.night_actions[actor_id] = {
-                "type": "heal",
-                "actor": actor_id,
-                "role": "Doctor",
-                "target": action.get("target"),
-                "_from_retri": action.get("corpse_player_id"),
-            }
-        elif corpse_role == "Transporter":
-            game.night_actions[actor_id] = {
-                "type": "transport",
-                "actor": actor_id,
-                "role": "Transporter",
-                "targets": action.get("targets"),
-                "_from_retri": action.get("corpse_player_id"),
-            }
-        elif corpse_role == "Bodyguard":
-            game.night_actions[actor_id] = {
-                "type": "ret_protect",
-                "actor": actor_id,
-                "role": "Bodyguard",
-                "target": action.get("target"),
-                "_from_retri": action.get("corpse_player_id"),
-            }
-        elif corpse_role in {"Sheriff", "Investigator"}:
-            game.night_actions[actor_id] = {
-                "type": "investigate",
-                "actor": actor_id,
-                "role": corpse_role,
-                "target": action.get("target"),
-                "_from_retri": action.get("corpse_player_id"),
-            }
-        elif corpse_role == "Lookout":
-            game.night_actions[actor_id] = {
-                "type": "watch",
-                "actor": actor_id,
-                "role": "Lookout",
-                "target": action.get("target"),
-                "_from_retri": action.get("corpse_player_id"),
-            }
-        elif corpse_role == "Tracker":
-            game.night_actions[actor_id] = {
-                "type": "track",
-                "actor": actor_id,
-                "role": "Tracker",
-                "target": action.get("target"),
-                "_from_retri": action.get("corpse_player_id"),
-            }
-        elif corpse_role == "Escort":
-            game.night_actions[actor_id] = {
-                "type": "roleblock",
-                "actor": actor_id,
-                "role": "Escort",
-                "target": action.get("target"),
-                "_from_retri": action.get("corpse_player_id"),
-            }
-        elif corpse_role == "Vigilante":
-            game.night_actions[actor_id] = {
-                "type": "shoot",
-                "actor": actor_id,
-                "role": "Vigilante",
-                "target": action.get("target"),
-                "_from_retri": action.get("corpse_player_id"),
-            }
 
 
 def _write_repro(*, name: str, payload: Dict[str, Any]) -> Path:
@@ -349,6 +363,8 @@ async def scenario_ignite_is_unstoppable_even_through_heal() -> None:
 
 
 async def scenario_transport_redirects_witch_control_targets() -> None:
+    from engine.night import effective_primary_target
+
     game, guild, _members = make_game(seed=80, n=7)
     game.player_roles.update(
         {
@@ -363,20 +379,21 @@ async def scenario_transport_redirects_witch_control_targets() -> None:
     )
     game.role_states[3] = {"shots_remaining": 1}
 
-    # Transport swaps 5 <-> 6.
+    # Transport swaps 5 <-> 6; Witch forces Vigilante to shoot 5 (effective visit 6).
     game.night_actions[1] = {"type": "transport", "actor": 1, "role": "Transporter", "targets": [5, 6]}
-    # Witch controls Vigilante (3) to shoot 5 => after transport redirect, should become 6.
     game.night_actions[2] = {"type": "control", "actor": 2, "role": "Witch", "targets": [3, 5]}
-    # Vigilante submitted an action; Witch will redirect it.
     game.night_actions[3] = {"type": "shoot", "actor": 3, "role": "Vigilante", "target": 4}
 
     out = await run_night_pipeline(game, guild)
-    # Control targets should have been redirected by transport pass (captured snapshot).
-    assert out["night_actions_after_transports"][2]["targets"][1] == 6, "Transport should redirect Witch final target"
+    assert int(game.night_actions[3]["target"]) == 5
+    assert effective_primary_target(game, 3) == 6
+    assert 6 in out["deaths"], f"Vigilante shot should land on transported slot 6; deaths={out['deaths']}"
     assert_post_night_invariants(game, out)
 
 
 async def scenario_transport_does_not_redirect_self_only_actions() -> None:
+    from engine.night import effective_primary_target
+
     game, guild, _members = make_game(seed=81, n=6)
     game.player_roles.update(
         {
@@ -388,28 +405,28 @@ async def scenario_transport_does_not_redirect_self_only_actions() -> None:
             6: "Townie",
         }
     )
-    # Transport swaps 5 <-> 6.
+    game.role_states[2] = {"self_heals_remaining": 1}
     game.night_actions[1] = {"type": "transport", "actor": 1, "role": "Transporter", "targets": [5, 6]}
-    # Doctor heals 5 (should redirect to 6).
     game.night_actions[2] = {"type": "heal", "actor": 2, "role": "Doctor", "target": 5}
-    # Survivor vests (self-only; should not gain or change a target field).
     game.night_actions[3] = {"type": "vest", "actor": 3, "role": "Survivor"}
 
     out = await run_night_pipeline(game, guild)
-    assert out["night_actions_after_transports"][2]["target"] == 6, "Transport should redirect normal single-target actions"
-    assert "target" not in out["night_actions_after_transports"][3], "Transport must not inject/redirect targets for self-only actions"
+    assert int(game.night_actions[2]["target"]) == 5
+    assert effective_primary_target(game, 2) == 6
+    assert out["healed_by_map"].get(6) == 2
+    assert game.night_actions[3].get("type") == "vest"
     assert_post_night_invariants(game, out)
 
 
 async def scenario_witch_cannot_retarget_self_only_actions() -> None:
     game, guild, _members = make_game(seed=82, n=5)
     game.player_roles.update({1: "Witch", 2: "Survivor", 3: "Townie", 4: "Townie", 5: "Townie"})
-    # Survivor vests; Witch attempts to control Survivor to target someone else (should do nothing).
+    game.role_states[2] = {"vests_remaining": 2}
     game.night_actions[2] = {"type": "vest", "actor": 2, "role": "Survivor"}
     game.night_actions[1] = {"type": "control", "actor": 1, "role": "Witch", "targets": [2, 3]}
 
     out = await run_night_pipeline(game, guild)
-    assert out["night_actions_after_control"][2].get("type") == "vest", "Witch should not redirect self-only actions"
+    assert game.night_actions[2].get("type") == "vest", "Witch should not redirect self-only actions"
     assert_post_night_invariants(game, out)
 
 
@@ -421,7 +438,7 @@ async def scenario_witch_can_prevent_arsonist_ignite_by_forcing_douse() -> None:
     game.night_actions[1] = {"type": "control", "actor": 1, "role": "Witch", "targets": [2, 4]}
 
     out = await run_night_pipeline(game, guild)
-    act2 = out["night_actions_after_control"][2]
+    act2 = game.night_actions[2]
     assert act2.get("type") == "douse", "Witch control should convert Arsonist ignite into douse"
     assert act2.get("target") == 4, "Witch-forced douse should target Witch's chosen victim"
     assert_post_night_invariants(game, out)
@@ -430,7 +447,7 @@ async def scenario_witch_can_prevent_arsonist_ignite_by_forcing_douse() -> None:
 async def scenario_arsonist_ignite_while_doused_kills_self() -> None:
     game, guild, _members = make_game(seed=84, n=4)
     game.player_roles.update({1: "Arsonist", 2: "Townie", 3: "Townie", 4: "Doctor"})
-    # Design intent: Ignite is treated as a powerful, unstoppable effect in this ruleset.
+    # Design intent: Ignite is Unstoppable in this ruleset (see config IGNITE_ATTACK_TIER).
     # It bypasses defense and also kills the Arsonist if they are currently doused.
     game.doused_players = {1, 2}
     game.night_actions[1] = {"type": "ignite", "actor": 1, "role": "Arsonist"}
@@ -465,9 +482,12 @@ async def scenario_transport_does_not_redirect_pirate_plunder() -> None:
     # Transport swaps 5 <-> 6.
     game.night_actions[1] = {"type": "transport", "actor": 1, "role": "Transporter", "targets": [5, 6]}
     # Pirate plunders 5; should not be redirected to 6.
-    game.night_actions[2] = {"type": "plunder", "actor": 2, "role": "Pirate", "target": 5, "duel_won": True}
+    game.night_actions[2] = {"type": "plunder", "actor": 2, "role": "Pirate", "target": 5, "duel_won": True, "duel_finished": True}
+    from engine.night import effective_primary_target
+
     out = await run_night_pipeline(game, guild)
-    assert out["night_actions_after_transports"][2]["target"] == 5, "Transport must not redirect Pirate actions"
+    assert int(game.night_actions[2]["target"]) == 5
+    assert effective_primary_target(game, 2) == 5, "Transport must not redirect Pirate plunder visit"
     assert_post_night_invariants(game, out)
 
 
@@ -477,8 +497,12 @@ async def scenario_witch_redirects_mafia_kill_target() -> None:
     game.night_actions[2] = {"type": "kill", "actor": 2, "role": "Mobster", "target": 3}
     # Witch controls Mobster to target 5 instead.
     game.night_actions[1] = {"type": "control", "actor": 1, "role": "Witch", "targets": [2, 5]}
+    from engine.night import effective_primary_target
+
     out = await run_night_pipeline(game, guild)
-    assert out["night_actions_after_control"][2].get("target") == 5, "Witch should redirect Mobster kill target"
+    assert int(game.night_actions[2]["target"]) == 5, "Witch should redirect Mobster kill target in action row"
+    assert effective_primary_target(game, 2) == 5
+    assert 5 in out["deaths"]
     assert_post_night_invariants(game, out)
 
 
@@ -565,6 +589,200 @@ async def scenario_vigilante_guilt_town_vs_mafia() -> None:
     assert_post_night_invariants(game2, out2)
 
 
+async def scenario_blocked_investigator_gets_interrupt() -> None:
+    game, guild, members = make_game(seed=122, n=4)
+    game.player_roles.update({1: "Investigator", 2: "Escort", 3: "Doctor", 4: "Mobster"})
+    game.night_actions[1] = {"type": "investigate", "actor": 1, "role": "Investigator", "target": 3}
+    game.night_actions[2] = {"type": "roleblock", "actor": 2, "role": "Escort", "target": 1}
+    out = await run_night_pipeline(game, guild)
+    assert_dm_received(members[1], "could not investigate")
+    assert_post_night_invariants(game, out)
+
+
+async def scenario_blocked_tracker_gets_track_interrupt() -> None:
+    game, guild, members = make_game(seed=124, n=4)
+    game.player_roles.update({1: "Tracker", 2: "Escort", 3: "Doctor", 4: "Mobster"})
+    game.night_actions[1] = {"type": "track", "actor": 1, "role": "Tracker", "target": 4}
+    game.night_actions[2] = {"type": "roleblock", "actor": 2, "role": "Escort", "target": 1}
+    out = await run_night_pipeline(game, guild)
+    assert_dm_received(members[1], "could not track")
+    assert_post_night_invariants(game, out)
+
+
+async def scenario_blocked_lookout_gets_watch_interrupt() -> None:
+    game, guild, members = make_game(seed=125, n=4)
+    game.player_roles.update({1: "Lookout", 2: "Escort", 3: "Doctor", 4: "Mobster"})
+    game.night_actions[1] = {"type": "watch", "actor": 1, "role": "Lookout", "target": 3}
+    game.night_actions[2] = {"type": "roleblock", "actor": 2, "role": "Escort", "target": 1}
+    out = await run_night_pipeline(game, guild)
+    assert_dm_received(members[1], "could not watch")
+    assert_post_night_invariants(game, out)
+
+
+async def scenario_witch_receives_controlled_sheriff_result() -> None:
+    game, guild, members = make_game(seed=126, n=3)
+    game.day_number = 2
+    game.player_roles.update({1: "Witch", 2: "Sheriff", 3: "Mobster"})
+    game.role_states[1] = {"has_learned_role": False, "night1_shield_used": False}
+    game.night_actions = {
+        1: {"type": "control", "actor": 1, "role": "Witch", "targets": [2, 3]},
+        2: {"type": "investigate", "actor": 2, "role": "Sheriff", "target": 1},
+    }
+    out = await run_night_pipeline(game, guild)
+    assert_dm_received(members[2], "suspicious")
+    assert_dm_received(members[1], "suspicious")
+    assert_post_night_invariants(game, out)
+
+
+async def scenario_witch_receives_controlled_investigator_bucket() -> None:
+    game, guild, members = make_game(seed=127, n=3)
+    game.day_number = 2
+    game.player_roles.update({1: "Witch", 2: "Investigator", 3: "Mobster"})
+    game.role_states[1] = {"has_learned_role": False, "night1_shield_used": False}
+    game.night_actions = {
+        1: {"type": "control", "actor": 1, "role": "Witch", "targets": [2, 3]},
+        2: {"type": "investigate", "actor": 2, "role": "Investigator", "target": 1},
+    }
+    out = await run_night_pipeline(game, guild)
+    assert_dm_received(members[2], "could be")
+    assert_dm_received(members[1], "could be")
+    assert_post_night_invariants(game, out)
+
+
+async def scenario_mobster_investigator_protective_shield_bucket() -> None:
+    game, guild, members = make_game(seed=128, n=3)
+    game.player_roles.update({1: "Investigator", 2: "Mobster", 3: "Doctor"})
+    game.night_actions[1] = {"type": "investigate", "actor": 1, "role": "Investigator", "target": 2}
+    out = await run_night_pipeline(game, guild)
+    txt = "\n".join(members[1].inbox)
+    assert "Bodyguard" in txt and "Mobster" in txt, txt
+    assert "Vigilante" not in txt, "Mobster must resolve to bucket 9 only, not Loaded Guns"
+    assert_post_night_invariants(game, out)
+
+
+async def scenario_chaos_records_visit_targets() -> None:
+    game, guild, _members = make_game(seed=129, n=4)
+    game.player_roles.update({1: "Chaos", 2: "Doctor", 3: "Mobster", 4: "Townie"})
+    game.role_states[1] = {"uses_remaining": 2}
+    game.night_actions[1] = {"type": "chaos", "actor": 1, "role": "Chaos", "targets": [2, 3]}
+    out = await run_night_pipeline(game, guild)
+    st = game.role_states.get(1, {})
+    targets = st.get("chaos_visit_targets")
+    assert st.get("chaos_used_this_night") is True
+    assert isinstance(targets, list) and set(int(x) for x in targets) == {2, 3}
+    assert_post_night_invariants(game, out)
+
+
+async def scenario_corrupt_misc_snapshot_still_heals() -> None:
+    """misc_phase_complete without healed_by must not skip Doctor heals (resume guard)."""
+    game, guild, _members = make_game(seed=131, n=4)
+    game.player_roles.update({1: "Doctor", 2: "Mobster", 3: "Townie", 4: "Townie"})
+    game.role_states[1] = {"self_heals_remaining": 1}
+    game.night_completion_snapshot = {
+        "day": game.day_number,
+        "game_key": game.game_key,
+        "misc_phase_complete": True,
+    }
+    game.night_actions[1] = {"type": "heal", "actor": 1, "role": "Doctor", "target": 3}
+    game.night_actions[2] = {"type": "kill", "actor": 2, "role": "Mobster", "target": 3}
+    out = await run_night_pipeline(game, guild)
+    assert 3 not in out["deaths"], "Heal must apply when heal map was not snapshotted"
+    assert_post_night_invariants(game, out)
+
+
+async def scenario_investigative_checkpoint_no_duplicate_watch_dm() -> None:
+    """Second pipeline pass with investigative_phase_complete must not re-DM Lookout."""
+    game, guild, members = make_game(seed=132, n=3)
+    game.player_roles.update({1: "Lookout", 2: "Doctor", 3: "Mobster"})
+    game.night_actions[1] = {"type": "watch", "actor": 1, "role": "Lookout", "target": 2}
+    await run_night_pipeline(game, guild)
+    assert len(members[1].inbox) == 1
+    await run_night_pipeline(game, guild)
+    assert len(members[1].inbox) == 1, "Checkpoint should suppress duplicate investigative DM"
+
+
+async def scenario_lookout_excludes_self_heal_from_visitors() -> None:
+    game, guild, members = make_game(seed=133, n=3)
+    game.player_roles.update({1: "Lookout", 2: "Doctor", 3: "Mobster"})
+    game.night_actions[1] = {"type": "watch", "actor": 1, "role": "Lookout", "target": 2}
+    game.night_actions[2] = {"type": "heal", "actor": 2, "role": "Doctor", "target": 2}
+    out = await run_night_pipeline(game, guild)
+    txt = "\n".join(members[1].inbox).lower()
+    assert "p1" not in txt, "Lookout must not list their own seat as a visitor"
+    assert_post_night_invariants(game, out)
+
+
+async def scenario_witch_steals_psychic_vision() -> None:
+    game, guild, members = make_game(seed=134, n=5)
+    game.day_number = 3
+    game.player_roles.update(
+        {1: "Witch", 2: "Psychic", 3: "Mobster", 4: "Doctor", 5: "Townie"}
+    )
+    game.role_states[1] = {"has_learned_role": False, "night1_shield_used": False}
+    game.night_actions[1] = {"type": "control", "actor": 1, "role": "Witch", "targets": [2, 3]}
+    out = await run_night_pipeline(game, guild)
+    witch_txt = "\n".join(members[1].inbox).lower()
+    assert "bent" in witch_txt or "stolen vision" in witch_txt, members[1].inbox
+    assert_post_night_invariants(game, out)
+
+
+async def scenario_transport_ack_uses_effective_visit_house() -> None:
+    from engine.night import effective_primary_target
+
+    game, _guild, _members = make_game(seed=135, n=4)
+    game.player_roles.update({1: "Transporter", 2: "Sheriff", 3: "Mobster", 4: "Doctor"})
+    game.night_transport_swaps = [(2, 3, 1)]
+    game.night_actions[2] = {"type": "investigate", "actor": 2, "role": "Sheriff", "target": 2}
+    _atype, ids, _fmt = game._action_target_summary(game.night_actions[2], actor_id=2)
+    assert ids == [3], "Ack should show transported house, not submitted slot"
+    assert effective_primary_target(game, 2) == 3
+
+
+async def scenario_blocked_sheriff_gets_investigate_interrupt() -> None:
+    game, guild, members = make_game(seed=136, n=4)
+    game.player_roles.update({1: "Sheriff", 2: "Escort", 3: "Mobster", 4: "Doctor"})
+    game.night_actions[1] = {"type": "investigate", "actor": 1, "role": "Sheriff", "target": 3}
+    game.night_actions[2] = {"type": "roleblock", "actor": 2, "role": "Escort", "target": 1}
+    out = await run_night_pipeline(game, guild)
+    assert_dm_received(members[1], "could not investigate")
+    assert "suspicious" not in "\n".join(members[1].inbox).lower()
+    assert_post_night_invariants(game, out)
+
+
+async def scenario_mole_consig_reveals_exact_role() -> None:
+    game, guild, members = make_game(seed=137, n=3)
+    game.player_roles.update({1: "Mole", 2: "Mobster", 3: "Doctor"})
+    game.role_states[1] = {"uses_remaining": 1}
+    game.night_actions[1] = {"type": "investigate", "actor": 1, "role": "Mole", "target": 2}
+    out = await run_night_pipeline(game, guild)
+    assert_dm_received(members[1], "Mobster")
+    assert_post_night_invariants(game, out)
+
+
+async def scenario_seer_gaze_two_town_reads_friends() -> None:
+    game, guild, members = make_game(seed=138, n=5)
+    game.player_roles.update({1: "Seer", 2: "Doctor", 3: "Sheriff", 4: "Mobster", 5: "Escort"})
+    game.night_actions[1] = {"type": "gaze", "actor": 1, "role": "Seer", "targets": [2, 3]}
+    out = await run_night_pipeline(game, guild)
+    assert any("friend" in msg.lower() for msg in members[1].inbox), members[1].inbox
+    assert_post_night_invariants(game, out)
+
+
+async def scenario_investigator_frame_beats_douse() -> None:
+    """Framed + doused town reads as Framer bucket, not Arsonist (engine tamper order)."""
+    game, guild, members = make_game(seed=123, n=4)
+    game.player_roles.update({1: "Framer", 2: "Arsonist", 3: "Investigator", 4: "Doctor"})
+    game.role_states[1] = {}
+    game.night_actions[1] = {"type": "frame", "actor": 1, "role": "Framer", "target": 4}
+    game.night_actions[2] = {"type": "douse", "actor": 2, "role": "Arsonist", "target": 4}
+    game.doused_players.add(4)
+    game.night_actions[3] = {"type": "investigate", "actor": 3, "role": "Investigator", "target": 4}
+    out = await run_night_pipeline(game, guild)
+    assert_dm_received(members[3], "Framer")
+    assert "Arsonist" not in "\n".join(members[3].inbox), "Douse should not override frame for Investigator"
+    assert_post_night_invariants(game, out)
+
+
 async def scenario_framer_alters_investigations() -> None:
     # Sheriff sees framed target as suspicious.
     game, guild, members = make_game(seed=120, n=4)
@@ -601,6 +819,7 @@ async def scenario_roleblocked_visitor_does_not_trigger_alert() -> None:
 async def scenario_gatekeeper_blocks_non_mafia_visitors() -> None:
     game, guild, _members = make_game(seed=140, n=5)
     game.player_roles.update({1: "Gatekeeper", 2: "Doctor", 3: "Mobster", 4: "Doctor", 5: "Townie"})
+    game.role_states[1] = {"uses_remaining": 2}
     # Gatekeeper guards 4. Doctor 2 tries to heal 4; should be blocked by gatekeeper and not apply.
     game.night_actions[1] = {"type": "guard", "actor": 1, "role": "Gatekeeper", "target": 4}
     game.night_actions[2] = {"type": "heal", "actor": 2, "role": "Doctor", "target": 4}
@@ -633,6 +852,7 @@ async def scenario_witch_night1_shield() -> None:
     out = await run_night_pipeline(game, guild)
     assert 1 not in out["deaths"], "Witch should survive first Night 1 attack"
     assert game.role_states.get(1, {}).get("night1_shield_used") is True, "Witch shield should be marked used"
+    assert game.role_states.get(1, {}).get("attacked_tonight_reason") == "witch_shield"
     assert_post_night_invariants(game, out)
 
     # Night 2+: Witch should die to normal kill.
@@ -643,6 +863,29 @@ async def scenario_witch_night1_shield() -> None:
     game2.night_actions[2] = {"type": "kill", "actor": 2, "role": "Mobster", "target": 1}
     out2 = await run_night_pipeline(game2, guild2)
     assert 1 in out2["deaths"], "Witch should not have shield after Night 1"
+    assert_post_night_invariants(game2, out2)
+
+
+async def scenario_jester_night1_shield() -> None:
+    # Night 1: Jester survives first normal kill (same rule shape as Witch/Chaos).
+    game, guild, _members = make_game(seed=162, n=3)
+    game.day_number = 1
+    game.player_roles.update({1: "Jester", 2: "Mobster", 3: "Doctor"})
+    game.role_states[1] = {"night1_shield_used": False}
+    game.night_actions[2] = {"type": "kill", "actor": 2, "role": "Mobster", "target": 1}
+    out = await run_night_pipeline(game, guild)
+    assert 1 not in out["deaths"], "Jester should survive first Night 1 attack"
+    assert game.role_states.get(1, {}).get("night1_shield_used") is True, "Jester shield should be marked used"
+    assert game.role_states.get(1, {}).get("attacked_tonight_reason") == "jester_shield"
+    assert_post_night_invariants(game, out)
+
+    game2, guild2, _members2 = make_game(seed=163, n=3)
+    game2.day_number = 2
+    game2.player_roles.update({1: "Jester", 2: "Mobster", 3: "Doctor"})
+    game2.role_states[1] = {"night1_shield_used": True}
+    game2.night_actions[2] = {"type": "kill", "actor": 2, "role": "Mobster", "target": 1}
+    out2 = await run_night_pipeline(game2, guild2)
+    assert 1 in out2["deaths"], "Jester should not have shield after Night 1"
     assert_post_night_invariants(game2, out2)
 
 
@@ -666,11 +909,79 @@ async def scenario_pirate_plunder_roleblocks_even_on_loss() -> None:
     game.role_states[2] = {"shots_remaining": 1}
     game.role_states[3] = {"alerts_remaining": 2}
     game.night_actions[3] = {"type": "alert", "actor": 3, "role": "Scary Grandma"}
-    game.night_actions[1] = {"type": "plunder", "actor": 1, "role": "Pirate", "target": 2, "duel_won": False}
+    game.night_actions[1] = {
+        "type": "plunder",
+        "actor": 1,
+        "role": "Pirate",
+        "target": 2,
+        "duel_won": False,
+        "duel_finished": True,
+    }
     game.night_actions[2] = {"type": "shoot", "actor": 2, "role": "Vigilante", "target": 3}
     out = await run_night_pipeline(game, guild)
     assert 2 in out["blocked"], "Pirate plunder should roleblock even if duel is lost"
     assert 2 not in out["deaths"], "Roleblocked visitor should not trigger Grandma alert"
+    assert_post_night_invariants(game, out)
+
+
+async def scenario_pirate_win_requires_plunder_kill() -> None:
+    """Duel win alone does not increment wins; target must die to pirate_plunder."""
+    game, guild, _members = make_game(seed=181, n=4)
+    game.player_roles.update({1: "Pirate", 2: "Doctor", 3: "Townie", 4: "Mobster"})
+    game.role_states[1] = {"wins": 0}
+    game.role_states[2] = {"self_heals_remaining": 1}
+    game.night_actions[2] = {"type": "heal", "actor": 2, "role": "Doctor", "target": 3}
+    game.night_actions[1] = {
+        "type": "plunder",
+        "actor": 1,
+        "role": "Pirate",
+        "target": 3,
+        "duel_won": True,
+        "duel_finished": True,
+    }
+    out = await run_night_pipeline(game, guild)
+    assert 3 not in out["deaths"], "Doctor heal should stop a powerful plunder kill"
+    assert int(game.role_states.get(1, {}).get("wins", 0)) == 0, "No win without a plunder kill"
+    assert_post_night_invariants(game, out)
+
+    game2, guild2, _members2 = make_game(seed=182, n=3)
+    game2.player_roles.update({1: "Pirate", 2: "Townie", 3: "Mobster"})
+    game2.role_states[1] = {"wins": 0}
+    game2.night_actions[1] = {
+        "type": "plunder",
+        "actor": 1,
+        "role": "Pirate",
+        "target": 2,
+        "duel_won": True,
+        "duel_finished": True,
+    }
+    out2 = await run_night_pipeline(game2, guild2)
+    assert 2 in out2["deaths"], "Plunder should kill an unarmored target when duel is won"
+    assert game2.night_death_causes.get(2) == "pirate_plunder"
+    assert int(game2.role_states.get(1, {}).get("wins", 0)) == 1, "Win counts only after plunder kill"
+    assert_post_night_invariants(game2, out2)
+
+
+async def scenario_first_healer_wins_on_duplicate_heal_target() -> None:
+    """When two healers target the same player, the first processed healer wins (HEAL-001)."""
+    game, guild, _members = make_game(seed=183, n=5)
+    game.player_roles.update({1: "Doctor", 2: "Retributionist", 3: "Mobster", 4: "Townie", 5: "Townie"})
+    game.role_states[1] = {"self_heals_remaining": 1}
+    game.role_states[2] = {"uses_remaining": 2, "used_corpses": []}
+    game.graveyard = [{"player_id": 99, "real_role": "Doctor"}]
+    game.night_actions[1] = {"type": "heal", "actor": 1, "role": "Doctor", "target": 4}
+    game.night_actions[2] = {
+        "type": "reanimate",
+        "actor": 2,
+        "role": "Retributionist",
+        "corpse_player_id": 99,
+        "corpse_role": "Doctor",
+        "target": 4,
+    }
+    game.night_actions[3] = {"type": "kill", "actor": 3, "role": "Mobster", "target": 4}
+    out = await run_night_pipeline(game, guild)
+    assert out["healed_by_map"].get(4) == 1, "Living Doctor should win the heal map slot"
+    assert 4 not in out["deaths"], "First heal should still protect the target"
     assert_post_night_invariants(game, out)
 
 
@@ -704,14 +1015,285 @@ async def scenario_chain_roleblock_fixed_point() -> None:
     assert 4 not in out["blocked"], "Roleblock from a blocked roleblocker should not apply"
     assert_post_night_invariants(game, out)
 
+
+async def scenario_broken_wrong_lookout_dm() -> None:
+    """Fails on assert_dm_received (wrong visitor role in DM text)."""
+    game, guild, members = make_game(seed=41_009, n=4)
+    game.player_roles.update({1: "Lookout", 2: "Doctor", 3: "Mobster", 4: "Townie"})
+    game.night_actions[1] = {"type": "watch", "actor": 1, "role": "Lookout", "target": 2}
+    game.night_actions[2] = {"type": "heal", "actor": 2, "role": "Doctor", "target": 2}
+    game.night_actions[3] = {"type": "kill", "actor": 3, "role": "Mobster", "target": 4}
+    out = await run_night_pipeline(game, guild)
+    assert_dm_received(members[1], "visited by the Pirate")
+    assert_post_night_invariants(game, out)
+
+
+async def scenario_broken_healed_town_listed_as_dead() -> None:
+    """Fails on night deaths assert (Doctor heal should prevent death)."""
+    game, guild, _members = make_game(seed=41_010, n=4)
+    game.player_roles.update({1: "Vigilante", 2: "Doctor", 3: "Mobster", 4: "Townie"})
+    game.role_states[1] = {"shots_remaining": 1}
+    game.night_actions[1] = {"type": "shoot", "actor": 1, "role": "Vigilante", "target": 2}
+    game.night_actions[2] = {"type": "heal", "actor": 2, "role": "Doctor", "target": 2}
+    out = await run_night_pipeline(game, guild)
+    assert 2 in out["deaths"], "Healed Doctor should be in deaths (wrong)"
+    assert_post_night_invariants(game, out)
+
+
+async def scenario_broken_guilt_after_mafia_shot() -> None:
+    """Fails on role_states assert (guilt applies to town kills, not mafia)."""
+    game, guild, _members = make_game(seed=41_011, n=3)
+    game.player_roles.update({1: "Vigilante", 2: "Mobster", 3: "Doctor"})
+    game.role_states[1] = {"shots_remaining": 1}
+    game.night_actions[1] = {"type": "shoot", "actor": 1, "role": "Vigilante", "target": 2}
+    out = await run_night_pipeline(game, guild)
+    assert game.role_states.get(1, {}).get("guilty_tomorrow") is True, "Vigilante should feel guilt after shooting Mafia (wrong)"
+    assert_post_night_invariants(game, out)
+
+
+async def scenario_broken_blocked_investigator_expects_bucket() -> None:
+    """Fails on assert_dm_received (Escort block should interrupt, not return a bucket)."""
+    game, guild, members = make_game(seed=41_012, n=4)
+    game.player_roles.update({1: "Investigator", 2: "Escort", 3: "Doctor", 4: "Mobster"})
+    game.night_actions[1] = {"type": "investigate", "actor": 1, "role": "Investigator", "target": 4}
+    game.night_actions[2] = {"type": "roleblock", "actor": 2, "role": "Escort", "target": 1}
+    out = await run_night_pipeline(game, guild)
+    assert_dm_received(members[1], "Your target could be a member of the Mafia")
+    assert_post_night_invariants(game, out)
+
+
+async def scenario_broken_roleblocked_bodyguard_saved_target() -> None:
+    """Fails on deaths assert (blocked Bodyguard does not protect)."""
+    game, guild, _members = make_game(seed=41_013, n=6)
+    game.player_roles.update({1: "Bodyguard", 2: "Escort", 3: "Mobster", 4: "Doctor", 5: "Townie", 6: "Townie"})
+    game.role_states[1] = {"uses_remaining": 1, "self_protects_remaining": 1}
+    game.night_actions[1] = {"type": "protect", "actor": 1, "role": "Bodyguard", "target": 4}
+    game.night_actions[2] = {"type": "roleblock", "actor": 2, "role": "Escort", "target": 1}
+    game.night_actions[3] = {"type": "kill", "actor": 3, "role": "Mobster", "target": 4}
+    out = await run_night_pipeline(game, guild)
+    assert 4 not in out["deaths"], "Protected Doctor should survive Mafia kill (wrong)"
+    assert_post_night_invariants(game, out)
+
+
+async def scenario_broken_sheriff_expects_godfather_line() -> None:
+    """Fails on assert_dm_received (Sheriff on Mobster is not a Godfather reveal)."""
+    game, guild, members = make_game(seed=41_014, n=3)
+    game.player_roles.update({1: "Sheriff", 2: "Doctor", 3: "Mobster"})
+    game.night_actions[1] = {"type": "investigate", "actor": 1, "role": "Sheriff", "target": 3}
+    out = await run_night_pipeline(game, guild)
+    assert_dm_received(members[1], "You investigated the Godfather")
+    assert_post_night_invariants(game, out)
+
+
+async def scenario_broken_mafia_kill_survived_wrong() -> None:
+    """Fails on deaths assert (unhealed Townie should die)."""
+    game, guild, _members = make_game(seed=41_015, n=4)
+    game.player_roles.update({1: "Mobster", 2: "Doctor", 3: "Townie", 4: "Townie"})
+    game.night_actions[1] = {"type": "kill", "actor": 1, "role": "Mobster", "target": 3}
+    out = await run_night_pipeline(game, guild)
+    assert 3 not in out["deaths"], "Mafia kill should not kill unhealed Townie (wrong)"
+    assert_post_night_invariants(game, out)
+
+
+async def scenario_broken_post_night_invariants() -> None:
+    """Fails on assert_post_night_invariants after corrupting death-cause bookkeeping."""
+    game, guild, _members = make_game(seed=41_016, n=3)
+    game.player_roles.update({1: "Mobster", 2: "Doctor", 3: "Townie"})
+    game.night_actions[1] = {"type": "kill", "actor": 1, "role": "Mobster", "target": 3}
+    out = await run_night_pipeline(game, guild)
+    assert 3 in out["deaths"]
+    game.night_death_causes = {}
+    assert_post_night_invariants(game, out)
+
+
+# Deliberately failing scenarios — not in SCENARIO_FUNCTIONS. Use --broken-scenario / --broken-scenario-only.
+BROKEN_SCENARIO_FUNCTIONS: Tuple[Callable[[], Any], ...] = (
+    scenario_broken_wrong_lookout_dm,
+    scenario_broken_healed_town_listed_as_dead,
+    scenario_broken_guilt_after_mafia_shot,
+    scenario_broken_blocked_investigator_expects_bucket,
+    scenario_broken_roleblocked_bodyguard_saved_target,
+    scenario_broken_sheriff_expects_godfather_line,
+    scenario_broken_mafia_kill_survived_wrong,
+    scenario_broken_post_night_invariants,
+)
+
+
+# Ordered behavioral regression suite (high-signal; run by default before fuzz/systematic).
+SCENARIO_FUNCTIONS: Tuple[Callable[[], Any], ...] = (
+    scenario_transport_redirects_target,
+    scenario_control_immune_role_not_redirected,
+    scenario_corrupted_actions_do_not_crash,
+    scenario_gatekeeper_corrupted_guard_target_does_not_crash,
+    scenario_graveyard_corruption_does_not_crash_sync,
+    scenario_ignite_is_unstoppable_even_through_heal,
+    scenario_transport_redirects_witch_control_targets,
+    scenario_transport_does_not_redirect_self_only_actions,
+    scenario_witch_cannot_retarget_self_only_actions,
+    scenario_witch_can_prevent_arsonist_ignite_by_forcing_douse,
+    scenario_arsonist_ignite_while_doused_kills_self,
+    scenario_arsonist_basic_defense_survives_normal_kill,
+    scenario_transport_does_not_redirect_pirate_plunder,
+    scenario_witch_redirects_mafia_kill_target,
+    scenario_executioner_converts_to_jester_on_target_non_lynch,
+    scenario_executioner_marks_win_on_lynch,
+    scenario_arsonist_clean_removes_douse,
+    scenario_bodyguard_blocked_does_not_protect,
+    scenario_vigilante_guilt_town_vs_mafia,
+    scenario_blocked_investigator_gets_interrupt,
+    scenario_blocked_tracker_gets_track_interrupt,
+    scenario_blocked_lookout_gets_watch_interrupt,
+    scenario_witch_receives_controlled_sheriff_result,
+    scenario_witch_receives_controlled_investigator_bucket,
+    scenario_mobster_investigator_protective_shield_bucket,
+    scenario_chaos_records_visit_targets,
+    scenario_corrupt_misc_snapshot_still_heals,
+    scenario_investigative_checkpoint_no_duplicate_watch_dm,
+    scenario_lookout_excludes_self_heal_from_visitors,
+    scenario_witch_steals_psychic_vision,
+    scenario_transport_ack_uses_effective_visit_house,
+    scenario_blocked_sheriff_gets_investigate_interrupt,
+    scenario_mole_consig_reveals_exact_role,
+    scenario_seer_gaze_two_town_reads_friends,
+    scenario_investigator_frame_beats_douse,
+    scenario_framer_alters_investigations,
+    scenario_roleblocked_visitor_does_not_trigger_alert,
+    scenario_gatekeeper_blocks_non_mafia_visitors,
+    scenario_revealed_mayor_cannot_be_healed,
+    scenario_witch_night1_shield,
+    scenario_jester_night1_shield,
+    scenario_retributionist_reanimate_doctor_heals,
+    scenario_pirate_plunder_roleblocks_even_on_loss,
+    scenario_pirate_win_requires_plunder_kill,
+    scenario_first_healer_wins_on_duplicate_heal_target,
+    scenario_lookout_dm_lists_visitors,
+    scenario_chain_roleblock_fixed_point,
+)
+
+
+def _scenario_list(*, include_broken: bool, broken_only: bool) -> Tuple[Callable[[], Any], ...]:
+    if broken_only:
+        return BROKEN_SCENARIO_FUNCTIONS
+    if include_broken:
+        return (*SCENARIO_FUNCTIONS, *BROKEN_SCENARIO_FUNCTIONS)
+    return SCENARIO_FUNCTIONS
+
+
+async def run_all_scenarios(*, include_broken: bool = False, broken_only: bool = False) -> int:
+    fns = _scenario_list(include_broken=include_broken, broken_only=broken_only)
+    for i, fn in enumerate(fns, start=1):
+        name = getattr(fn, "__name__", repr(fn))
+        print(f"scenario {i}/{len(fns)}: {name}...", flush=True)
+        try:
+            await fn()
+        except Exception:
+            print(f"scenario FAILED: {name}", flush=True)
+            raise
+    return len(fns)
+
+
+async def _probe_invariant_failure() -> None:
+    """Deliberately corrupt post-pipeline state; post-night invariants must reject it."""
+    game, guild, _members = make_game(seed=99_991, n=3)
+    game.player_roles.update({1: "Doctor", 2: "Mobster", 3: "Townie"})
+    game.night_actions = {2: {"type": "kill", "actor": 2, "role": "Mobster", "target": 3}}
+    out = await run_night_pipeline(game, guild)
+    game.night_death_causes = {}
+    try:
+        assert_post_night_invariants(game, out)
+    except AssertionError:
+        return
+    raise AssertionError("post_night_invariants should have failed on empty night_death_causes")
+
+
+async def _probe_scenario_assertion_failure() -> None:
+    """Scenario-style DM assert with impossible substring must fail."""
+    game, guild, members = make_game(seed=99_992, n=3)
+    game.player_roles.update({1: "Sheriff", 2: "Doctor", 3: "Mobster"})
+    game.night_actions[1] = {"type": "investigate", "actor": 1, "role": "Sheriff", "target": 3}
+    out = await run_night_pipeline(game, guild)
+    try:
+        assert_dm_received(members[1], "__SIM_PROBE_MISSING_DM__")
+        assert_post_night_invariants(game, out)
+    except AssertionError:
+        return
+    raise AssertionError("assert_dm_received should have failed on missing substring")
+
+
+def _probe_worker_crash_task(_task: object) -> None:
+    raise RuntimeError("sim_test probe: intentional systematic worker crash")
+
+
+async def _probe_systematic_worker_failure() -> None:
+    """Pool worker exceptions must surface to the parent process."""
+    try:
+        with ProcessPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(_probe_worker_crash_task, (None,))
+            fut.result()
+    except RuntimeError as e:
+        if "intentional systematic worker crash" not in str(e):
+            raise AssertionError(f"unexpected worker error: {e}") from e
+        return
+    raise AssertionError("expected worker crash")
+
+
+async def _probe_systematic_coverage_propagates() -> None:
+    """Serial systematic path must raise when a roleset run fails."""
+
+    async def _boom(**_kwargs: object) -> SystematicRunStats:
+        raise ValueError("sim_test probe: intentional roleset failure")
+
+    import sys
+
+    mod = sys.modules[__name__]
+    real = mod._systematic_one_roleset
+    mod._systematic_one_roleset = _boom  # type: ignore[assignment]
+    try:
+        try:
+            await systematic_action_coverage(
+                role_sets=[["Mobster", "Doctor", "Sheriff", "Townie", "Townie", "Townie", "Townie"]],
+                jobs=1,
+                save_repros=False,
+                sample_per_combo=2,
+                tuple_size=2,
+            )
+        except ValueError as e:
+            if "intentional roleset failure" not in str(e):
+                raise AssertionError(f"unexpected: {e}") from e
+            return
+        raise AssertionError("expected systematic_action_coverage to fail")
+    finally:
+        mod._systematic_one_roleset = real
+
+
+async def run_failure_probes() -> None:
+    checks = [
+        ("post_night_invariants", _probe_invariant_failure),
+        ("scenario_dm_assert", _probe_scenario_assertion_failure),
+        ("systematic_worker", _probe_systematic_worker_failure),
+        ("systematic_serial", _probe_systematic_coverage_propagates),
+    ]
+    for label, fn in checks:
+        try:
+            await fn()
+        except AssertionError:
+            print(f"probe {label}: sim harness caught AssertionError", flush=True)
+            continue
+        except (RuntimeError, ValueError) as e:
+            if "intentional" in str(e) or "systematic worker failed" in str(e):
+                print(f"probe {label}: sim harness caught {type(e).__name__}", flush=True)
+                continue
+            raise
+        print(f"probe {label}: failure propagated as expected", flush=True)
+    print("failure_probes: all checks behaved as expected", flush=True)
+
+
 async def fuzz_night_actions_no_throw(*, iterations: int = 200, seed: int = 999) -> None:
     rng = random.Random(int(seed))
-    game, guild, _members = make_game(seed=int(seed) ^ 0xBEEF, n=8)
+    game, guild, members = make_game(seed=int(seed) ^ 0xBEEF, n=8)
     # Give everyone a role so invariants can hold even as actions mutate.
     roles = ["Townie", "Doctor", "Escort", "Investigator", "Vigilante", "Lookout", "Tracker", "Transporter"]
-    for i, r in enumerate(roles, start=1):
-        game.player_roles[i] = r
-        game.role_states.setdefault(i, {})
+    roles_by_seat = {i: r for i, r in enumerate(roles, start=1)}
 
     # Broaden fuzz coverage to most engine action types.
     action_types = [
@@ -739,8 +1321,12 @@ async def fuzz_night_actions_no_throw(*, iterations: int = 200, seed: int = 999)
         # Keep reanimate out of fuzz here; sim_test expands it and expects strict corpse metadata.
     ]
     for _ in range(iterations):
-        game.night_actions.clear()
-        game.doused_players.clear()
+        reset_night_game_state(
+            game,
+            members=members,
+            roles_by_seat=roles_by_seat,
+            day_number=1,
+        )
         # Randomly inject malformed and well-formed actions.
         for actor_id in range(1, 9):
             if rng.random() < 0.5:
@@ -783,11 +1369,13 @@ def _pools_for_player_count(player_count: int) -> Tuple[List[str], List[str], Li
     Enumerate exactly the same *role pools* and (mafia, neutral) counts as bot generation,
     but without any weighting/shuffling randomness.
     """
-    num_mafia, num_neutral = mcs._bot_num_mafia_neutral(player_count)
+    num_mafia, num_neutral = mc_gen._bot_num_mafia_neutral(player_count)
     num_town = player_count - num_mafia - num_neutral
-    town_pool = [r for r, _w in mcs._bot_town_weights(player_count)]
-    mafia_support_pool = [r for r, _w in mcs._bot_mafia_support_weights(player_count)]
-    neutral_pool = list(mcs._bot_neutral_pool(player_count))
+    town_pool = [r for r, _w in mc_gen._bot_town_weights(player_count)]
+    mafia_support_pool = [r for r, _w in mc_gen._bot_mafia_support_weights(player_count)]
+    # Full bracket display pool (deterministic); legality filtered via neutral_combo_draw_legal.
+    pool = game_roles.start_pool_for_player_count(player_count, rng=random.Random(0))
+    neutral_pool = list(pool.neutral_pool_for_display)
     return town_pool, mafia_support_pool, neutral_pool, num_town, num_mafia, num_neutral
 
 
@@ -803,17 +1391,34 @@ def enumerate_all_role_sets(player_count: int) -> Iterable[List[str]]:
     assert num_neutral >= 0, f"Unexpected neutral count: {num_neutral}"
     assert num_town >= 0, f"Unexpected town count: {num_town}"
 
-    # Current generator: for <=9 players -> 2 mafia total, 1 neutral. (So support_count=1)
+    # Generator-legal role-sets for supported (num_mafia, num_neutral) brackets.
     support_count = max(0, num_mafia - 1)
-    if support_count != 1:
+    if support_count not in (0, 1):
         raise AssertionError(f"Unsupported mafia support count for enumeration: {support_count} (player_count={player_count})")
-    if num_neutral != 1:
+    if num_neutral not in (1, 2):
         raise AssertionError(f"Unsupported neutral count for enumeration: {num_neutral} (player_count={player_count})")
 
-    for neutral in neutral_pool:
-        for mafia_support in mafia_support_pool:
+    if num_neutral == 1:
+        neutral_iters: Iterable[List[str]] = (
+            [n] for n in neutral_pool if game_roles.neutral_combo_draw_legal([n])
+        )
+    else:
+        neutral_iters = (
+            list(c)
+            for c in itertools.combinations(neutral_pool, num_neutral)
+            if game_roles.neutral_combo_draw_legal(c)
+        )
+
+    support_iters: Iterable[List[str]]
+    if support_count == 0:
+        support_iters = [[]]
+    else:
+        support_iters = ([s] for s in mafia_support_pool)
+
+    for neutrals in neutral_iters:
+        for mafia_support in support_iters:
             for town_roles in itertools.combinations(town_pool, num_town):
-                roles = ["Mobster", mafia_support, neutral, *town_roles]
+                roles = ["Mobster", *mafia_support, *neutrals, *town_roles]
                 if len(roles) != player_count:
                     continue
                 if len(set(roles)) != len(roles):
@@ -908,7 +1513,92 @@ def _action_for_role(role: str, *, rng: random.Random) -> Optional[Dict[str, Any
         return {"type": "plunder", "duel_won": bool(rng.getrandbits(1))}
     if role in {"Framer"}:
         return {"type": "frame"}
+    if role in {"Bodyguard"}:
+        return {"type": "protect"}
+    if role in {"Scary Grandma"}:
+        return {"type": "alert"}
+    if role in {"Survivor"}:
+        return {"type": "vest"}
+    if role in {"Gatekeeper"}:
+        return {"type": "guard"}
+    if role in {"Guardian Angel"}:
+        return {"type": "ward"}
+    if role in {"Chaos"}:
+        return {"type": "chaos"}
+    if role in {"Serial Killer"}:
+        return {"type": "sk_kill"}
     return None
+
+
+def role_must_submit_night_action(role: str) -> bool:
+    """True when the engine accepts a normal night command for this role (sim / bot)."""
+    return _action_for_role(role, rng=random.Random(0)) is not None
+
+
+def _build_mandatory_night_action(
+    *,
+    actor_id: int,
+    role: str,
+    role_by_id: Dict[int, str],
+    role_states: Dict[int, Dict[str, Any]],
+    rng: random.Random,
+) -> Optional[Dict[str, Any]]:
+    """Build a night_actions payload for roles that should act; None for passive roles."""
+    act = _action_for_role(role, rng=rng)
+    if act is None:
+        return None
+
+    payload: Dict[str, Any] = {"actor": actor_id, "role": role, **act}
+    ids = list(role_by_id.keys())
+    others = [i for i in ids if i != actor_id]
+    target = rng.choice(others) if others else actor_id
+    t1, t2 = rng.sample(ids, 2) if len(ids) >= 2 else (actor_id, actor_id)
+
+    a_type = payload["type"]
+    if a_type in {"transport", "control", "chaos"}:
+        payload["targets"] = [t1, t2]
+    elif a_type == "alert":
+        payload["target"] = actor_id
+    elif a_type == "vest":
+        payload.pop("target", None)
+    elif a_type == "ward":
+        bind = role_states.get(actor_id, {}).get("ga_target_id")
+        payload["target"] = int(bind) if bind is not None else target
+    else:
+        payload["target"] = target
+
+    if a_type == "plunder":
+        payload["duel_finished"] = True
+        payload.setdefault("duel_won", bool(rng.getrandbits(1)))
+    if a_type == "sk_kill":
+        payload.setdefault("target", target)
+
+    return payload
+
+
+def _fill_mandatory_night_actions(
+    game: Game,
+    *,
+    role_by_id: Dict[int, str],
+    rng: random.Random,
+    skip_seats: Optional[Set[int]] = None,
+) -> None:
+    """Ensure every role with a night command submits an action (realistic full-lobby nights)."""
+    skip = skip_seats or set()
+    for seat, role in role_by_id.items():
+        if seat in skip or seat in game.night_actions:
+            continue
+        if not role_must_submit_night_action(role):
+            continue
+        payload = _build_mandatory_night_action(
+            actor_id=seat,
+            role=role,
+            role_by_id=role_by_id,
+            role_states=game.role_states,
+            rng=rng,
+        )
+        if payload is not None:
+            game.night_actions[seat] = payload
 
 
 def _systematic_variants_for_role(role: str) -> List[Dict[str, Any]]:
@@ -1013,7 +1703,19 @@ def _systematic_variants_for_role(role: str) -> List[Dict[str, Any]]:
         return [{"type": "vest"}]
     if role in {"Gatekeeper"}:
         return [{"type": "guard", "target_class": "town"}, {"type": "guard", "target_class": "other"}]
-    # For roles that don't participate in night engine (Mayor/Executioner/Jester/Chaos/etc),
+    if role == "Seer":
+        return [
+            {"type": "gaze", "targets_classes": ("town", "town")},
+            {"type": "gaze", "targets_classes": ("mafia", "town")},
+            {"type": "gaze", "targets_classes": ("neutral", "town")},
+        ]
+    if role == "Chaos":
+        return [
+            {"type": "chaos", "targets_classes": ("town", "mafia")},
+            {"type": "chaos", "targets_classes": ("town", "town")},
+            {"type": "chaos", "targets_classes": ("other", "other")},
+        ]
+    # For roles that don't participate in night engine (Mayor/Executioner/Jester/etc),
     # "no action" is enough for this sim.
     return []
 
@@ -1101,81 +1803,317 @@ def _init_state_for_role(role: str) -> Dict[str, Any]:
     if role == "Retributionist":
         return {"uses_remaining": 2, "used_corpses": []}
     if role == "Chaos":
-        return {"uses_remaining": 2}
+        return {"uses_remaining": 2, "night1_shield_used": False}
     if role == "Witch":
         return {"night1_shield_used": False, "has_learned_role": False}
+    if role == "Jester":
+        return {"night1_shield_used": False}
+    if role == "Mole":
+        return {"uses_remaining": 1}
+    if role == "Gatekeeper":
+        return {"uses_remaining": 2}
     return {}
 
 
-async def exhaustive_role_combos_no_crash(*, player_count: int, per_combo_nights: int = 2, seed: int = 123) -> None:
+def _variant_tuple_key(variant_tuple: Tuple[Dict[str, Any], ...]) -> str:
+    return json.dumps(list(variant_tuple), sort_keys=True, default=str)
+
+
+def _iter_variant_tuples(
+    variant_lists: List[List[Dict[str, Any]]],
+    *,
+    combo_rng: random.Random,
+    sample_per_combo: int,
+) -> Iterable[Tuple[Dict[str, Any], ...]]:
+    """Full cartesian when sample_per_combo <= 0; else K deterministic random variant draws per seat combo."""
+    if sample_per_combo <= 0:
+        yield from itertools.product(*variant_lists)
+        return
+    seen: Set[str] = set()
+    attempts = 0
+    cap = max(sample_per_combo * 30, sample_per_combo)
+    while len(seen) < sample_per_combo and attempts < cap:
+        attempts += 1
+        picked = tuple(combo_rng.choice(vl) for vl in variant_lists)
+        key = _variant_tuple_key(picked)
+        if key in seen:
+            continue
+        seen.add(key)
+        yield picked
+
+
+async def _exhaustive_one_roleset(
+    *,
+    rs_i: int,
+    roles: List[str],
+    player_count: int,
+    per_combo_nights: int,
+    seed: int,
+    save_repros: bool,
+) -> None:
+    rng = random.Random(int(seed) + int(rs_i) * 7_919)
+    game, guild, _members = make_game(seed=int(seed) + int(rs_i), n=player_count)
+    for seat, role in enumerate(roles, start=1):
+        game.player_roles[seat] = role
+        game.role_states.setdefault(seat, dict(_init_state_for_role(role)))
+
+    roles_by_seat = {seat: game.player_roles[seat] for seat in range(1, player_count + 1)}
+
+    for _night in range(per_combo_nights):
+        reset_night_game_state(
+            game,
+            members=_members,
+            roles_by_seat=roles_by_seat,
+            day_number=1,
+        )
+        for actor_id in range(1, player_count + 1):
+            role = game.player_roles[actor_id]
+            act = _action_for_role(role, rng=rng)
+            if act is None:
+                continue
+            if rng.random() < 0.35:
+                continue
+
+            payload: Dict[str, Any] = {"actor": actor_id, "role": role, **act}
+
+            if payload["type"] in {"transport", "control", "chaos"}:
+                if rng.random() < 0.03:
+                    payload["targets"] = [rng.choice([[], {}, "x", None]), rng.choice([[], {}, "y", None])]
+                else:
+                    a = rng.randint(1, player_count)
+                    b = rng.randint(1, player_count)
+                    payload["targets"] = [a, b]
+            elif payload["type"] in {"ignite"}:
+                if rng.random() < 0.03:
+                    payload["target"] = rng.choice([[], {}, "bad", None])
+            else:
+                if rng.random() < 0.03:
+                    payload["target"] = rng.choice([[], {}, "oops", None])
+                else:
+                    payload["target"] = rng.randint(1, player_count)
+
+            game.night_actions[actor_id] = payload
+
+        out = await run_night_pipeline(game, guild)
+        assert_post_night_invariants(game, out)
+
+
+def _exhaustive_roleset_worker(
+    task: Tuple[int, List[str], int, int, int, bool],
+) -> Tuple[int, Optional[str]]:
+    rs_i, roles, player_count, per_combo_nights, seed, save_repros = task
+    try:
+        asyncio.run(
+            _exhaustive_one_roleset(
+                rs_i=rs_i,
+                roles=roles,
+                player_count=player_count,
+                per_combo_nights=per_combo_nights,
+                seed=seed,
+                save_repros=save_repros,
+            )
+        )
+        return rs_i, None
+    except Exception:
+        return rs_i, traceback.format_exc()
+
+
+async def exhaustive_role_combos_no_crash(
+    *,
+    player_count: int,
+    per_combo_nights: int = 2,
+    seed: int = 123,
+    jobs: Optional[int] = None,
+    save_repros: bool = True,
+) -> None:
     """
-    For every generator-legal 7p role-set, run a couple randomized nights through the real engine.
-    Goal: ensure the night pipeline never throws across the entire 7p role-space.
+    For every generator-legal role-set at player_count, run randomized nights through the real engine.
+    Goal: ensure the night pipeline never throws across the bracket role-space.
     """
-    rng = random.Random(seed)
     combos = list(enumerate_all_role_sets(player_count))
     total = len(combos)
 
-    # Expected scale sanity for <=9p: should be tens of thousands, not millions.
-    assert 10_000 <= total <= 200_000, f"Enumeration size unexpected: player_count={player_count} total={total}"
+    assert 10_000 <= total <= 250_000, f"Enumeration size unexpected: player_count={player_count} total={total}"
 
-    for idx, roles in enumerate(combos, start=1):
-        game, guild, _members = make_game(seed=seed + idx, n=7)
-        # Assign roles to seats 1..7 deterministically for repeatability.
-        for seat, role in enumerate(roles, start=1):
-            game.player_roles[seat] = role
-            game.role_states.setdefault(seat, {})
+    n_jobs = 1 if jobs == 1 else max(1, min(int(jobs or 1), total))
 
-        for _night in range(per_combo_nights):
-            game.night_actions.clear()
-            for actor_id in range(1, 8):
-                role = game.player_roles[actor_id]
-                act = _action_for_role(role, rng=rng)
-                if act is None:
-                    continue
-                if rng.random() < 0.35:
-                    continue
-
-                payload: Dict[str, Any] = {"actor": actor_id, "role": role, **act}
-
-                # Provide targets; occasionally corrupt types to ensure corruption tolerance stays solid.
-                if payload["type"] in {"transport", "control"}:
-                    if rng.random() < 0.03:
-                        payload["targets"] = [rng.choice([[], {}, "x", None]), rng.choice([[], {}, "y", None])]
-                    else:
-                        a = rng.randint(1, 7)
-                        b = rng.randint(1, 7)
-                        payload["targets"] = [a, b]
-                elif payload["type"] in {"ignite"}:
-                    if rng.random() < 0.03:
-                        payload["target"] = rng.choice([[], {}, "bad", None])
-                else:
-                    if rng.random() < 0.03:
-                        payload["target"] = rng.choice([[], {}, "oops", None])
-                    else:
-                        payload["target"] = rng.randint(1, 7)
-
-                game.night_actions[actor_id] = payload
-
+    if n_jobs <= 1:
+        for idx, roles in enumerate(combos, start=1):
             try:
-                out = await run_night_pipeline(game, guild)
-                assert_post_night_invariants(game, out)
+                await _exhaustive_one_roleset(
+                    rs_i=idx,
+                    roles=roles,
+                    player_count=player_count,
+                    per_combo_nights=per_combo_nights,
+                    seed=seed,
+                    save_repros=save_repros,
+                )
             except Exception as e:
-                repro = {
-                    "kind": "exhaustive_role_combos_no_crash",
-                    "player_count": player_count,
-                    "seed": seed,
-                    "roles": roles,
-                    "roleset_index": idx,
-                    "night_actions": {str(k): v for k, v in game.night_actions.items()},
-                    "exception": {"type": type(e).__name__, "message": str(e)},
-                }
-                p = _write_repro(name=f"exhaustive{player_count}p", payload=repro)
-                print(f"WROTE REPRO: {p}", flush=True)
+                if save_repros:
+                    repro = {
+                        "kind": "exhaustive_role_combos_no_crash",
+                        "player_count": player_count,
+                        "seed": seed,
+                        "roles": roles,
+                        "roleset_index": idx,
+                        "exception": {"type": type(e).__name__, "message": str(e)},
+                    }
+                    p = _write_repro(name=f"exhaustive{player_count}p", payload=repro)
+                    print(f"WROTE REPRO: {p}", flush=True)
                 raise
+            if idx % 2000 == 0:
+                print(f"exhaustive_{player_count}p: {idx}/{total} role-sets OK...", flush=True)
+        return
 
-        if idx % 2000 == 0:
-            print(f"exhaustive_{player_count}p: {idx}/{total} role-sets OK...", flush=True)
+    tasks = [
+        (idx, roles, player_count, per_combo_nights, seed, save_repros)
+        for idx, roles in enumerate(combos, start=1)
+    ]
+    done = 0
+    with ProcessPoolExecutor(max_workers=n_jobs) as pool:
+        futures = [pool.submit(_exhaustive_roleset_worker, t) for t in tasks]
+        for fut in as_completed(futures):
+            rs_i, err = fut.result()
+            done += 1
+            if err:
+                print(f"CRASH exhaustive roleset_index={rs_i}\n{err[:2000]}", flush=True)
+                raise RuntimeError(f"exhaustive worker failed at roleset_index={rs_i}")
+            if done % 2000 == 0:
+                print(f"exhaustive_{player_count}p: {done}/{total} role-sets OK...", flush=True)
+
+
+async def _systematic_one_roleset(
+    *,
+    rs_i: int,
+    roles: List[str],
+    seed: int,
+    per_roleset_pair_samples: int,
+    save_repros: bool,
+    dedupe_actions: bool,
+    tuple_size: int = 2,
+    all_roles_act: bool = True,
+    sample_per_combo: int = 0,
+) -> SystematicRunStats:
+    stats = SystematicRunStats()
+    if tuple_size < 2 or tuple_size > len(roles):
+        raise ValueError(f"tuple_size must be 2..{len(roles)}, got {tuple_size}")
+
+    game, guild, members = make_game(seed=seed + rs_i, n=len(roles))
+    role_by_id = {seat: role for seat, role in enumerate(roles, start=1)}
+    roles_by_seat = dict(role_by_id)
+    seat_ids = list(range(1, len(roles) + 1))
+    seat_combos = list(itertools.combinations(seat_ids, tuple_size))
+
+    for seat_combo in seat_combos:
+        combo_roles = [role_by_id[sid] for sid in seat_combo]
+        variant_lists = [_variants_for_role(r) for r in combo_roles]
+        seen_keys: Set[str] = set()
+
+        for _sample in range(per_roleset_pair_samples):
+            combo_rng = random.Random(
+                _materialize_combo_seed(seed, rs_i, seat_combo, ())
+                + _sample * 1_048_583
+            )
+            for variant_tuple in _iter_variant_tuples(
+                variant_lists, combo_rng=combo_rng, sample_per_combo=int(sample_per_combo)
+            ):
+                reset_night_game_state(
+                    game,
+                    members=members,
+                    roles_by_seat=roles_by_seat,
+                    day_number=1,
+                )
+                night_rng = random.Random(
+                    _materialize_combo_seed(seed, rs_i, seat_combo, variant_tuple)
+                    + _sample * 1_048_583
+                )
+                game.night_actions.clear()
+
+                variant_by_seat = dict(zip(seat_combo, variant_tuple))
+                for sid, variant in variant_by_seat.items():
+                    if variant.get("type") == "noop":
+                        continue
+                    game.night_actions[sid] = _materialize_action(
+                        actor_id=sid,
+                        actor_role=role_by_id[sid],
+                        role_by_id=role_by_id,
+                        rng=night_rng,
+                        variant=variant,
+                    )
+
+                if all_roles_act:
+                    _fill_mandatory_night_actions(
+                        game,
+                        role_by_id=role_by_id,
+                        rng=night_rng,
+                        skip_seats=set(),
+                    )
+
+                if dedupe_actions and game.night_actions:
+                    action_key = _canonical_night_actions_key(game.night_actions)
+                    if action_key in seen_keys:
+                        stats.nights_deduped += 1
+                        continue
+                    seen_keys.add(action_key)
+
+                try:
+                    out = await run_night_pipeline(game, guild)
+                    assert_post_night_invariants(game, out)
+                    stats.nights_executed += 1
+                except Exception as e:
+                    if save_repros:
+                        repro = {
+                            "kind": "systematic_action_coverage",
+                            "seed": seed,
+                            "roles": roles,
+                            "roleset_index": rs_i,
+                            "tuple_size": tuple_size,
+                            "seats": list(seat_combo),
+                            "roles_by_seat": {str(s): role_by_id[s] for s in seat_combo},
+                            "variants_by_seat": {
+                                str(s): variant_by_seat[s] for s in seat_combo
+                            },
+                            "night_actions": {str(k): v for k, v in game.night_actions.items()},
+                            "exception": {"type": type(e).__name__, "message": str(e)},
+                        }
+                        p = _write_repro(name="systematic", payload=repro)
+                        print(f"WROTE REPRO: {p}", flush=True)
+                    raise e
+
+    return stats
+
+
+def _systematic_roleset_worker(
+    task: Tuple[int, List[str], int, int, bool, bool, int, bool, int],
+) -> Tuple[int, Optional[str], SystematicRunStats]:
+    (
+        rs_i,
+        roles,
+        seed,
+        per_roleset_pair_samples,
+        save_repros,
+        dedupe_actions,
+        tuple_size,
+        all_roles_act,
+        sample_per_combo,
+    ) = task
+    try:
+        stats = asyncio.run(
+            _systematic_one_roleset(
+                rs_i=rs_i,
+                roles=roles,
+                seed=seed,
+                per_roleset_pair_samples=per_roleset_pair_samples,
+                save_repros=save_repros,
+                dedupe_actions=dedupe_actions,
+                tuple_size=tuple_size,
+                all_roles_act=all_roles_act,
+                sample_per_combo=sample_per_combo,
+            )
+        )
+        return rs_i, None, stats
+    except Exception:
+        return rs_i, traceback.format_exc(), SystematicRunStats()
 
 
 async def systematic_action_coverage(
@@ -1184,75 +2122,79 @@ async def systematic_action_coverage(
     seed: int = 777,
     per_roleset_pair_samples: int = 1,
     save_repros: bool = True,
-) -> None:
+    dedupe_actions: bool = True,
+    jobs: Optional[int] = None,
+    tuple_size: int = 2,
+    all_roles_act: bool = True,
+    sample_per_combo: int = 0,
+) -> SystematicRunStats:
     """
-    Systematic (pairwise-style) action coverage:
-    for each role-set, for each pair of seats, run a few nights where ONLY those two seats act,
-    cycling through their meaningful action variants (plus a couple corruption variants).
+    Systematic action coverage per role-set and seat tuple.
+
+    ``sample_per_combo`` <= 0: full cartesian product of per-role variants.
+    ``sample_per_combo`` > 0: K random variant tuples per seat combo (seeded, deduped).
+
+    When ``all_roles_act`` is True (default), other seats also submit mandatory actions.
     """
-    rng = random.Random(seed)
-    for rs_i, roles in enumerate(role_sets, start=1):
-        game, guild, _members = make_game(seed=seed + rs_i, n=len(roles))
-        role_by_id: Dict[int, str] = {}
-        for seat, role in enumerate(roles, start=1):
-            game.player_roles[seat] = role
-            game.role_states.setdefault(seat, {}).update(_init_state_for_role(role))
-            role_by_id[seat] = role
+    role_sets_list = list(role_sets)
+    total_stats = SystematicRunStats()
+    mode = f"sample{sample_per_combo}" if sample_per_combo > 0 else "full"
+    label = f"{tuple_size}-way-{mode}"
+    n_jobs = 1 if jobs == 1 else max(1, min(int(jobs or default_trial_workers(len(role_sets_list))), len(role_sets_list)))
 
-        seat_ids = list(range(1, len(roles) + 1))
-        pairs = list(itertools.combinations(seat_ids, 2))
+    if n_jobs <= 1:
+        for rs_i, roles in enumerate(role_sets_list, start=1):
+            stats = await _systematic_one_roleset(
+                rs_i=rs_i,
+                roles=roles,
+                seed=seed,
+                per_roleset_pair_samples=per_roleset_pair_samples,
+                save_repros=save_repros,
+                dedupe_actions=dedupe_actions,
+                tuple_size=tuple_size,
+                all_roles_act=all_roles_act,
+                sample_per_combo=sample_per_combo,
+            )
+            total_stats.nights_executed += stats.nights_executed
+            total_stats.nights_deduped += stats.nights_deduped
+            if rs_i % 50 == 0:
+                print(
+                    f"systematic_{label}: {rs_i}/{len(role_sets_list)} role-sets OK...",
+                    flush=True,
+                )
+        return total_stats
 
-        for a_id, b_id in pairs:
-            # Re-init per-role counters each pair so depletion doesn't bleed across scenarios.
-            for seat, role in enumerate(roles, start=1):
-                game.role_states[seat] = _init_state_for_role(role)
-
-            a_role = role_by_id[a_id]
-            b_role = role_by_id[b_id]
-
-            a_variants = [{"type": "noop"}] + _systematic_variants_for_role(a_role) + _corruption_variants_for_role(a_role)
-            b_variants = [{"type": "noop"}] + _systematic_variants_for_role(b_role) + _corruption_variants_for_role(b_role)
-
-            # Keep it bounded: sample a small cross-product per pair.
-            # (We don't need the full cartesian product to catch most interaction bugs.)
-            for _ in range(per_roleset_pair_samples):
-                for av in a_variants:
-                    for bv in b_variants:
-                        game.night_actions.clear()
-
-                        if av.get("type") != "noop":
-                            game.night_actions[a_id] = _materialize_action(
-                                actor_id=a_id, actor_role=a_role, role_by_id=role_by_id, rng=rng, variant=av
-                            )
-                        if bv.get("type") != "noop":
-                            game.night_actions[b_id] = _materialize_action(
-                                actor_id=b_id, actor_role=b_role, role_by_id=role_by_id, rng=rng, variant=bv
-                            )
-
-                        try:
-                            out = await run_night_pipeline(game, guild)
-                            assert_post_night_invariants(game, out)
-                        except Exception as e:
-                            if save_repros:
-                                repro = {
-                                    "kind": "systematic_action_coverage",
-                                    "seed": seed,
-                                    "roles": roles,
-                                    "roleset_index": rs_i,
-                                    "pair": [a_id, b_id],
-                                    "a_role": a_role,
-                                    "b_role": b_role,
-                                    "a_variant": av,
-                                    "b_variant": bv,
-                                    "night_actions": {str(k): v for k, v in game.night_actions.items()},
-                                    "exception": {"type": type(e).__name__, "message": str(e)},
-                                }
-                                p = _write_repro(name="systematic", payload=repro)
-                                print(f"WROTE REPRO: {p}", flush=True)
-                            raise
-
-        if rs_i % 50 == 0:
-            print(f"systematic_actions: {rs_i} role-sets OK...", flush=True)
+    tasks = [
+        (
+            rs_i,
+            roles,
+            seed,
+            per_roleset_pair_samples,
+            save_repros,
+            dedupe_actions,
+            tuple_size,
+            all_roles_act,
+            sample_per_combo,
+        )
+        for rs_i, roles in enumerate(role_sets_list, start=1)
+    ]
+    done = 0
+    with ProcessPoolExecutor(max_workers=n_jobs) as pool:
+        futures = [pool.submit(_systematic_roleset_worker, t) for t in tasks]
+        for fut in as_completed(futures):
+            rs_i, err, stats = fut.result()
+            done += 1
+            if err:
+                print(f"CRASH roleset_index={rs_i}\n{err[:2000]}", flush=True)
+                raise RuntimeError(f"systematic worker failed at roleset_index={rs_i}")
+            total_stats.nights_executed += stats.nights_executed
+            total_stats.nights_deduped += stats.nights_deduped
+            if done % 50 == 0:
+                print(
+                    f"systematic_{label}: {done}/{len(role_sets_list)} role-sets OK...",
+                    flush=True,
+                )
+    return total_stats
 
 
 async def main() -> None:
@@ -1263,6 +2205,12 @@ async def main() -> None:
     ap.add_argument("--fuzz-iterations", type=int, default=200, help="How many fuzz iterations to run.")
     ap.add_argument("--skip-fuzz", action="store_true", help="Skip fuzz_night_actions_no_throw.")
     ap.add_argument("--skip-exhaustive", action="store_true", help="Skip exhaustive role-set enumeration.")
+    ap.add_argument(
+        "--exhaustive-nights",
+        type=int,
+        default=2,
+        help="Random nights per legal role-set in exhaustive sweep (default 2).",
+    )
     ap.add_argument("--systematic-actions", action="store_true", help="Enable systematic pairwise action-variant coverage.")
     ap.add_argument(
         "--systematic-role-sets",
@@ -1271,63 +2219,226 @@ async def main() -> None:
         help="How many role-sets to run systematic actions on (0 = all role-sets for player-count).",
     )
     ap.add_argument("--systematic-pair-samples", type=int, default=1, help="Repeat each seat-pair scenario set this many times.")
+    ap.add_argument(
+        "--jobs",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Parallel worker processes for --systematic-actions (default: CPU count). Use 1 or --serial for single-process.",
+    )
+    ap.add_argument(
+        "--serial",
+        action="store_true",
+        help="Run --systematic-actions in a single process (same as --jobs 1).",
+    )
+    ap.add_argument(
+        "--no-dedupe-actions",
+        action="store_true",
+        help="Disable skipping identical materialized night_actions within each seat-pair.",
+    )
+    ap.add_argument(
+        "--systematic-tuple-size",
+        type=int,
+        default=2,
+        choices=(2, 3, 4, 5),
+        help="Seat tuple size for --systematic-actions (2=pairwise … 5=penta).",
+    )
+    ap.add_argument(
+        "--isolated-systematic",
+        action="store_true",
+        help="Only the focal tuple acts (legacy pairwise isolation). Disables mandatory all-role actions.",
+    )
+    ap.add_argument(
+        "--systematic-sample",
+        type=int,
+        default=0,
+        metavar="K",
+        help="If K>0, run K random variant tuples per seat combo instead of full cartesian product.",
+    )
+    ap.add_argument(
+        "--deep",
+        action="store_true",
+        help=(
+            "Power deep 7p run (~30 min parallel, 12 jobs): 47 scenarios, fuzz 400, exhaustive "
+            "all 47,775 lineups x5 nights, sampled 2/3/4-way systematic (~10M+ pipeline nights)."
+        ),
+    )
+    ap.add_argument(
+        "--quad",
+        action="store_true",
+        help=(
+            "Bounded 4-way systematic run: enables --systematic-actions with tuple size 4, "
+            "skips fuzz/exhaustive, uses 8 players and 4 role-sets unless overridden."
+        ),
+    )
+    ap.add_argument(
+        "--penta",
+        action="store_true",
+        help=(
+            "Bounded 5-way systematic run: enables --systematic-actions with tuple size 5, "
+            "skips fuzz/exhaustive, uses 8 players and 4 role-sets unless overridden (~35 min)."
+        ),
+    )
+    ap.add_argument(
+        "--scenarios-only",
+        action="store_true",
+        help="Run only the behavioral scenario suite (skip fuzz, exhaustive, systematic).",
+    )
+    ap.add_argument(
+        "--probe-failure",
+        action="store_true",
+        help="Run built-in failure probes (verify asserts/ worker errors propagate); then exit.",
+    )
+    ap.add_argument(
+        "--broken-scenario",
+        action="store_true",
+        help=f"After the normal suite, run {len(BROKEN_SCENARIO_FUNCTIONS)} deliberate failing scenarios.",
+    )
+    ap.add_argument(
+        "--broken-scenario-only",
+        action="store_true",
+        help=f"Run only the {len(BROKEN_SCENARIO_FUNCTIONS)} deliberate failing scenarios (stops on first failure).",
+    )
     args = ap.parse_args()
 
+    if args.probe_failure:
+        await run_failure_probes()
+        print("sim_test.py: failure detection verified", flush=True)
+        return
+
+    if args.scenarios_only:
+        args.skip_fuzz = True
+        args.skip_exhaustive = True
+        args.systematic_actions = False
+
+    if args.broken_scenario_only:
+        args.skip_fuzz = True
+        args.skip_exhaustive = True
+        args.systematic_actions = False
+
+    if args.quad:
+        args.systematic_actions = True
+        args.systematic_tuple_size = 4
+        args.skip_fuzz = True
+        args.skip_exhaustive = True
+        if int(args.player_count) == 7:
+            args.player_count = 8
+        if int(args.systematic_role_sets) == 0:
+            args.systematic_role_sets = 4
+        # Avoid multi-process state-file races when not explicitly parallelized.
+        if not args.serial and args.jobs is None:
+            args.serial = True
+
+    if args.penta:
+        args.systematic_actions = True
+        args.systematic_tuple_size = 5
+        args.skip_fuzz = True
+        args.skip_exhaustive = True
+        if int(args.player_count) == 7:
+            args.player_count = 8
+        if int(args.systematic_role_sets) == 0:
+            args.systematic_role_sets = 4
+        if not args.serial and args.jobs is None:
+            args.serial = True
+
+    deep_systematic_plan: List[Tuple[int, int, int]] = []
+    if args.deep:
+        args.player_count = 7
+        args.skip_fuzz = False
+        args.fuzz_iterations = max(int(args.fuzz_iterations), 400)
+        args.exhaustive_nights = max(int(args.exhaustive_nights), 5)
+        args.systematic_actions = True
+        args.systematic_sample = 0
+        # (tuple_size, role_sets_cap, samples_per_seat_combo)
+        deep_systematic_plan = [(2, 9000, 56), (3, 2200, 20), (4, 1200, 14)]
+        n_7p_lineups = len(list(enumerate_all_role_sets(7)))
+        est_systematic = sum(
+            min(rs, n_7p_lineups) * math.comb(7, ts) * k for ts, rs, k in deep_systematic_plan
+        )
+        print(
+            f"deep plan: scenarios=47, fuzz>={args.fuzz_iterations}, "
+            f"exhaustive={n_7p_lineups}x{int(args.exhaustive_nights)} nights, "
+            f"systematic~{est_systematic:,} upper-bound pipeline nights (parallel)...",
+            flush=True,
+        )
+
+    n_scenarios = 0
     if not args.skip_scenarios:
-        await scenario_transport_redirects_target()
-        await scenario_control_immune_role_not_redirected()
-        await scenario_corrupted_actions_do_not_crash()
-        await scenario_gatekeeper_corrupted_guard_target_does_not_crash()
-        await scenario_graveyard_corruption_does_not_crash_sync()
-        await scenario_ignite_is_unstoppable_even_through_heal()
-        await scenario_transport_redirects_witch_control_targets()
-        await scenario_transport_does_not_redirect_self_only_actions()
-        await scenario_witch_cannot_retarget_self_only_actions()
-        await scenario_witch_can_prevent_arsonist_ignite_by_forcing_douse()
-        await scenario_arsonist_ignite_while_doused_kills_self()
-        await scenario_arsonist_basic_defense_survives_normal_kill()
-        await scenario_transport_does_not_redirect_pirate_plunder()
-        await scenario_witch_redirects_mafia_kill_target()
-        await scenario_arsonist_clean_removes_douse()
-        await scenario_bodyguard_blocked_does_not_protect()
-        await scenario_vigilante_guilt_town_vs_mafia()
-        await scenario_framer_alters_investigations()
-        await scenario_roleblocked_visitor_does_not_trigger_alert()
-        await scenario_gatekeeper_blocks_non_mafia_visitors()
-        await scenario_revealed_mayor_cannot_be_healed()
-        await scenario_witch_night1_shield()
-        await scenario_retributionist_reanimate_doctor_heals()
-        await scenario_pirate_plunder_roleblocks_even_on_loss()
-        await scenario_lookout_dm_lists_visitors()
-        await scenario_chain_roleblock_fixed_point()
-        await scenario_executioner_converts_to_jester_on_target_non_lynch()
-        await scenario_executioner_marks_win_on_lynch()
+        n_scenarios = await run_all_scenarios(
+            include_broken=bool(args.broken_scenario),
+            broken_only=bool(args.broken_scenario_only),
+        )
+        print(f"scenarios: {n_scenarios} passed", flush=True)
 
     if not args.skip_fuzz:
         await fuzz_night_actions_no_throw(iterations=int(args.fuzz_iterations), seed=int(args.seed))
 
     if not args.skip_exhaustive:
-        await exhaustive_role_combos_no_crash(player_count=int(args.player_count), seed=int(args.seed))
+        combos_list = list(enumerate_all_role_sets(int(args.player_count)))
+        n_exhaustive = len(combos_list)
+        if args.deep and not args.serial and args.jobs is None:
+            ex_jobs = default_trial_workers(n_exhaustive)
+        elif args.jobs is not None:
+            ex_jobs = max(1, int(args.jobs))
+        else:
+            ex_jobs = 1 if args.serial else default_trial_workers(n_exhaustive)
+        print(
+            f"exhaustive: {n_exhaustive} role-sets x {int(args.exhaustive_nights)} nights "
+            f"(random, jobs={ex_jobs})...",
+            flush=True,
+        )
+        await exhaustive_role_combos_no_crash(
+            player_count=int(args.player_count),
+            per_combo_nights=int(args.exhaustive_nights),
+            seed=int(args.seed),
+            jobs=ex_jobs,
+        )
+        print("exhaustive: OK", flush=True)
 
     if args.systematic_actions:
-        # Systematic action coverage is expensive; by default we run ALL 7p role-sets (user-requested).
-        limit = int(args.systematic_role_sets)
-        rolesets_iter: Iterable[List[str]]
-        rolesets_iter = enumerate_all_role_sets(int(args.player_count))
-        if limit > 0:
-            rolesets_iter = itertools.islice(rolesets_iter, limit)
-        await systematic_action_coverage(
-            role_sets=rolesets_iter,
-            seed=int(args.seed),
-            per_roleset_pair_samples=int(args.systematic_pair_samples),
-        )
+        plans: List[Tuple[int, int, int]] = deep_systematic_plan or [
+            (int(args.systematic_tuple_size), int(args.systematic_role_sets), int(args.systematic_sample))
+        ]
+        for tuple_size, role_limit, sample_k in plans:
+            limit = int(role_limit)
+            rolesets_iter: Iterable[List[str]] = enumerate_all_role_sets(int(args.player_count))
+            if limit > 0:
+                rolesets_iter = itertools.islice(rolesets_iter, limit)
+            rolesets_list = list(rolesets_iter)
+            if args.serial:
+                n_jobs = 1
+            elif args.jobs is not None:
+                n_jobs = max(1, int(args.jobs))
+            else:
+                n_jobs = default_trial_workers(len(rolesets_list))
+            print(
+                f"systematic: {tuple_size}-way, {len(rolesets_list)} role-sets, "
+                f"sample={sample_k or 'full'}, jobs={n_jobs}...",
+                flush=True,
+            )
+            stats = await systematic_action_coverage(
+                role_sets=rolesets_list,
+                seed=int(args.seed) + tuple_size * 1_000_003,
+                per_roleset_pair_samples=int(args.systematic_pair_samples),
+                dedupe_actions=not bool(args.no_dedupe_actions),
+                jobs=n_jobs,
+                tuple_size=int(tuple_size),
+                all_roles_act=not bool(args.isolated_systematic),
+                sample_per_combo=int(sample_k),
+            )
+            print(
+                f"systematic ({tuple_size}-way, sample={sample_k or 'full'}, "
+                f"all_roles_act={not args.isolated_systematic}): "
+                f"executed={stats.nights_executed} deduped_skips={stats.nights_deduped}",
+                flush=True,
+            )
 
     # Post-run invariants on a clean game.
     game, _guild, _members = make_game(seed=60, n=6)
     game.player_roles.update({1: "Townie", 2: "Townie", 3: "Townie", 4: "Townie", 5: "Townie", 6: "Townie"})
     assert_invariants(game)
 
-    print("sim_test.py: OK", flush=True)
+    print(f"sim_test.py: OK (scenarios={n_scenarios})", flush=True)
 
 
 if __name__ == "__main__":

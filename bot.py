@@ -13,12 +13,19 @@ import time
 import sys
 from roles import get_role_description
 from persistence import load_state
+import persistence
 from persistence import load_stats
 from checks import only_during_night_gameplay as only_during_night_gameplay_factory, enforce_allowed_guild
 from errors import on_app_command_tree_error, on_command_error as on_command_error_handler
 from game import Game, active_games, bind_bot, get_game_by_player_id, get_game_for_guild
 from engine.night import run_night_pipeline
+from gameplay import actions as gameplay_actions, state as gameplay_state, trials as gameplay_trials, resolution
+from gameplay.controller import Controller
+from gameplay.views import private_reply, NO_MENTIONS
 from database import Database
+from instance_lock import acquire_instance_lock
+import game_roles
+from config import role_starting_charges, chaos_starting_uses, guardian_angel_bind_pool_ids
 from config import (
     TRIBUNAL_RESUME_MIN_SECONDS,
     GAME_MASTER_ROLE,
@@ -65,89 +72,33 @@ def _tag() -> str:
     return f" [pid={int(os.getpid())} inst={_debug_instance}]"
 
 
-def _acquire_single_instance_lock() -> None:
-    """
-    Best-effort local single-instance guard.
+_single_instance_lock_handle = None
 
-    Prevents accidentally running both source + dist_runtime copies at once on the same machine.
-    Opt out with MAFIABOT_ALLOW_MULTI=1.
-    """
+
+def _acquire_single_instance_lock() -> None:
+    """Hold an OS lock for the process lifetime; a crash releases it safely."""
+    global _single_instance_lock_handle
     if os.environ.get("MAFIABOT_ALLOW_MULTI", "").strip().lower() in ("1", "true", "yes", "on"):
         _dbg("H7", "bot.py:single_instance", "single-instance lock bypassed", {})
         return
+    if _single_instance_lock_handle is not None:
+        return
 
-    # Use a machine-wide lock location so "source" and "dist_runtime" builds collide.
     base = os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or str(Path.home())
-    lock_path = Path(base) / "Mafiabot" / "bot.instance.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    while True:
-        try:
-            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            break
-        except FileExistsError:
-            # Check for stale lock.
-            existing_txt = ""
-            existing_pid: Optional[int] = None
-            try:
-                existing_txt = lock_path.read_text(encoding="utf-8")[:2000]
-                existing = json.loads(existing_txt) if existing_txt else {}
-                if isinstance(existing, dict) and "pid" in existing:
-                    existing_pid = int(existing["pid"])
-            except Exception:
-                existing_pid = None
-
-            alive = False
-            if existing_pid:
-                try:
-                    os.kill(existing_pid, 0)
-                    alive = True
-                except Exception:
-                    alive = False
-
-            if alive:
-                _dbg(
-                    "H7",
-                    "bot.py:single_instance",
-                    "lock exists; other instance appears alive",
-                    {"lock_path": str(lock_path), "existing_pid": existing_pid, "existing": existing_txt[:500]},
-                )
-                raise RuntimeError(
-                    f"Another Mafia Bot instance appears to be running (pid={existing_pid}). "
-                    f"Lock file exists: {lock_path}"
-                )
-
-            # Stale lock: remove and retry.
-            try:
-                lock_path.unlink(missing_ok=True)  # type: ignore[call-arg]
-            except TypeError:
-                # Python < 3.8 compat (not expected here, but safe).
-                try:
-                    if lock_path.exists():
-                        lock_path.unlink()
-                except Exception:
-                    pass
-            _dbg("H7", "bot.py:single_instance", "stale lock removed; retrying", {"lock_path": str(lock_path), "existing_pid": existing_pid})
-            continue
-        except OSError as e:
-            # If we can't enforce the guard, log and continue.
-            _dbg("H7", "bot.py:single_instance", "lock create failed; continuing", {"err": repr(e), "errno": getattr(e, "errno", None), "lock_path": str(lock_path)})
-            return
-
-    try:
-        info = {
-            "pid": int(os.getpid()),
-            "inst": _debug_instance,
-            "cwd": os.getcwd(),
-            "argv": list(getattr(sys, "argv", [])),
-            "ts_ms": int(time.time() * 1000),
-        }
-        os.write(fd, json.dumps(info, sort_keys=True).encode("utf-8"))
-        _dbg("H7", "bot.py:single_instance", "lock acquired", {"lock_path": str(lock_path), "info": info})
-    finally:
-        try:
-            os.close(fd)
-        except Exception:
-            pass
+    lock_path = Path(os.environ.get('MAFIABOT_INSTANCE_LOCK_PATH') or (Path(base) / "Mafiabot" / "bot.instance.lock"))
+    # Acquire before changing the file. Keep the handle open and never unlink
+    # the lock file, so duplicate startups cannot signal or evict the owner.
+    _single_instance_lock_handle = acquire_instance_lock(lock_path)
+    info = {
+        "pid": int(os.getpid()),
+        "inst": _debug_instance,
+        "cwd": os.getcwd(),
+        "argv": list(getattr(sys, "argv", [])),
+        "ts_ms": int(time.time() * 1000),
+    }
+    _single_instance_lock_handle.write(json.dumps(info, sort_keys=True).encode("utf-8"))
+    _single_instance_lock_handle.truncate()
+    _dbg("H7", "bot.py:single_instance", "lock acquired", {"lock_path": str(lock_path), "info": info})
 
 
 def _dbg(hypothesis_id: str, location: str, message: str, data: dict) -> None:
@@ -197,6 +148,7 @@ intents.message_content = True
 intents.dm_messages = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 bind_bot(bot)
+bot.gameplay_controller = Controller(bot)
 
 
 @bot.tree.error
@@ -431,23 +383,34 @@ class WillModal(discord.ui.Modal, title="Edit your Last Will"):
         placeholder="Type your will here...",
     )
 
-    def __init__(self, *, current_text: str) -> None:
+    def __init__(self, *, game: Game, owner_id: int, current_text: str) -> None:
         super().__init__()
+        self.game, self.owner_id, self.match_key = game, owner_id, game.game_key
         self.will.default = (current_text or "")[:1800]
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        game = get_game_by_player_id(interaction.user.id)
-        if not game or not game.in_progress:
-            return await interaction.response.send_message("No active game found for you.", ephemeral=True)
-        state = game.role_states.setdefault(interaction.user.id, {})
-        state["will"] = str(self.will.value or "")[:1800]
-        await game.persist_flush()
-        await interaction.response.send_message("Saved your will.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        game = self.game
+        def save():
+            gameplay_state.require_current(game)
+            if interaction.user.id != self.owner_id or game.game_key != self.match_key:
+                raise gameplay_state.Rejected("This editor belongs to an earlier game. Open !will again.")
+            if game.resolving:
+                raise gameplay_state.Rejected("Night is resolving. Please wait.")
+            game.role_states.setdefault(interaction.user.id, {})["will"] = str(self.will.value or "")[:1800]
+        try:
+            await gameplay_state.commit(game, save)
+            await private_reply(interaction, "Saved your will.")
+        except gameplay_state.Rejected as error:
+            await private_reply(interaction, str(error))
+        except OSError:
+            await private_reply(interaction, "Your will could not be saved. Please try again.")
 
 
 class WillView(discord.ui.View):
-    def __init__(self, *, owner_id: int, current_text: str) -> None:
+    def __init__(self, *, game: Game, owner_id: int, current_text: str) -> None:
         super().__init__(timeout=300)
+        self.game, self.match_key = game, game.game_key
         self.owner_id = owner_id
         self.current_text = current_text
 
@@ -456,11 +419,15 @@ class WillView(discord.ui.View):
         if interaction.user.id != self.owner_id:
             return await interaction.response.send_message("This isn't your will editor.", ephemeral=True)
         # Pull latest will text at click time (avoid overwriting with a stale prefill).
-        game = get_game_by_player_id(interaction.user.id)
-        latest = ""
-        if game and game.in_progress:
-            latest = str(game.role_states.get(interaction.user.id, {}).get("will", "") or "")
-        await interaction.response.send_modal(WillModal(current_text=latest))
+        game = self.game
+        try:
+            gameplay_state.require_current(game)
+            if game.game_key != self.match_key:
+                raise gameplay_state.Rejected("This editor belongs to an earlier game. Open !will again.")
+        except gameplay_state.Rejected as error:
+            return await private_reply(interaction, str(error))
+        latest = str(game.role_states.get(interaction.user.id, {}).get("will", "") or "")
+        await interaction.response.send_modal(WillModal(game=game, owner_id=self.owner_id, current_text=latest))
 
 
 # ==========================================
@@ -610,13 +577,15 @@ async def on_ready() -> None:
     _force_sync = os.environ.get("MAFIA_FORCE_COMMAND_SYNC", "").strip().lower() in ("1", "true", "yes", "on")
     if int(bot._mafia_ready_count) == 1 or _force_sync:  # type: ignore[attr-defined]
         try:
+            if hasattr(bot.tree,'copy_global_to'):
+                bot.tree.copy_global_to(guild=discord.Object(id=ALLOWED_GUILD_ID))
             synced = await bot.tree.sync(guild=discord.Object(id=ALLOWED_GUILD_ID))
             _dbg("H2", "bot.py:on_ready:guild_sync", "guild sync ok", {"count": len(synced)})
         except Exception:
             _dbg("H2", "bot.py:on_ready:guild_sync", "guild sync failed", {"allowed_guild_id": int(ALLOWED_GUILD_ID)})
             logging.exception("Failed to sync app commands for allowed guild.")
         try:
-            synced = await bot.tree.sync()
+            synced = [] if os.environ.get('MAFIABOT_TEST_PROFILE') == '1' else await bot.tree.sync()
             _dbg("H3", "bot.py:on_ready:global_sync", "global sync ok", {"count": len(synced)})
         except Exception:
             _dbg("H3", "bot.py:on_ready:global_sync", "global sync failed", {})
@@ -632,7 +601,7 @@ async def on_ready() -> None:
     # Initialize SQLite DB (leaderboards/history). Non-fatal if it fails.
     if not getattr(bot, "db", None):
         try:
-            db_path = str((Path(__file__).resolve().parent / "state" / "mafiabot.db"))
+            db_path = str(persistence.STATE_DIR / "mafiabot.db")
             bot.db = Database(db_path)  # type: ignore[attr-defined]
             bot.db.initialize()  # type: ignore[attr-defined]
         except Exception:
@@ -649,6 +618,13 @@ async def on_ready() -> None:
     # Attempt to restore persisted game state for the allowed guild.
     guild = bot.get_guild(ALLOWED_GUILD_ID)
     if guild:
+        # READY can fire again while trial/duel/resolution tasks are running.
+        # Those tasks and new commands must keep the same Game object.
+        if getattr(bot, "_mafia_state_restore_started", False) or ALLOWED_GUILD_ID in active_games:
+            logging.info("Preserving live game state on READY for guild %s.", ALLOWED_GUILD_ID)
+            return
+        # Set before the first await to prevent overlapping READY restores.
+        bot._mafia_state_restore_started = True
         data = load_state(ALLOWED_GUILD_ID)
         _dbg(
             "H5",
@@ -660,6 +636,11 @@ async def on_ready() -> None:
             try:
                 game = Game.from_persisted(data)
                 await game.rehydrate_members(guild)
+                # Do not publish a half-rehydrated game or replace one that
+                # commands created while member fetching was in progress.
+                if ALLOWED_GUILD_ID in active_games:
+                    logging.info("Preserving game created during startup recovery.")
+                    return
                 active_games[ALLOWED_GUILD_ID] = game
                 logging.info(f"Restored persisted game state for guild {ALLOWED_GUILD_ID}.")
 
@@ -698,24 +679,14 @@ async def on_ready() -> None:
                             )
                         await asyncio.sleep(0.05)
 
+                if game.in_progress:
+                    await bot.gameplay_controller.recover(game)
+                if game.gameplay.get("trial"):
+                    return
+                # Old reaction trials contain no durable ballot session. Clean them up
+                # rather than reconstructing a verdict from incomplete recovery data.
                 resume_defense = False
                 t_deadline = getattr(game, "tribunal_defense_deadline_utc", None)
-                t_sub = getattr(game, "tribunal_subphase", None)
-                if (
-                    game.in_progress
-                    and game.phase == "day"
-                    and game.vote_in_progress
-                    and t_sub == "defense"
-                    and t_deadline
-                    and getattr(game, "tribunal_defendant_id", None)
-                ):
-                    dtp = _parse_iso_utc(t_deadline)
-                    if dtp:
-                        rem_sec = (dtp - datetime.now(timezone.utc)).total_seconds()
-                        if TRIBUNAL_RESUME_MIN_SECONDS <= rem_sec <= 7200:
-                            resume_defense = True
-                            bot.loop.create_task(_resume_tribunal_defense_after_restart(guild, rem_sec))
-
                 # Best-effort repair: unstick day VC permissions unless we're mid-defense (resume will continue).
                 if game.in_progress and game.phase == "day" and game.day_vc_id and game.alive_role_id:
                     if not (game.vote_in_progress and getattr(game, "tribunal_subphase", None) == "defense"):
@@ -753,18 +724,16 @@ async def on_ready() -> None:
                             except discord.HTTPException:
                                 pass
 
-                    game.tribunal_muted = False
-                    game.tribunal_defendant_id = None
-                    game.tribunal_defense_deadline_utc = None
-                    game.tribunal_judgment_deadline_utc = None
-                    game.tribunal_judgment_message_id = None
-                    game.tribunal_subphase = None
-                    game.tribunal_verdict_committed = False
-                    game.vote_in_progress = False
+                    def clear_legacy_trial():
+                        gameplay_state.require_current(game, phase="day")
+                        if game.gameplay.get("trial"):
+                            raise gameplay_state.Rejected("A new trial has started.")
+                        gameplay_trials.clear_flags(game)
+                        game.tribunal_verdict_committed = False
                     try:
-                        await game.persist_flush()
-                    except Exception:
-                        pass
+                        await gameplay_state.commit(game, clear_legacy_trial)
+                    except gameplay_state.Rejected:
+                        return
                     gc = bot.get_channel(game.game_channel_id) if game.game_channel_id else None
                     if isinstance(gc, discord.TextChannel):
                         try:
@@ -885,52 +854,35 @@ async def leaderboard_slash(interaction: discord.Interaction) -> None:
 @bot.command(name='join')
 @commands.guild_only()
 async def join_game_command(ctx: commands.Context) -> None:
-    _dbg(
-        "H6",
-        "bot.py:join_game_command:entry",
-        "!join invoked",
-        {
-            "pid": int(os.getpid()),
-            "guild_id": int(ctx.guild.id) if ctx.guild else None,
-            "channel_id": int(ctx.channel.id) if getattr(ctx, "channel", None) else None,
-            "author_id": int(ctx.author.id),
-            "message_id": int(getattr(getattr(ctx, "message", None), "id", 0) or 0),
-        },
-    )
-    if get_game_by_player_id(ctx.author.id):
-        return await ctx.send(
-            "🛑 You are already in an active game in a server! Please finish that game before joining a new one." + _tag()
-        )
-
     game = get_game_for_guild(ctx.guild.id, allowed_guild_id=ALLOWED_GUILD_ID)
-    if game.in_progress:
-        return await ctx.send("A game is already in progress!" + _tag())
-    if ctx.author.id in [p.id for p in game.players]:
-        return await ctx.send("You are already on the waiting list!" + _tag())
-
-    game.players.append(ctx.author)
-    # Persist lobby so restarts don't lose the waiting list.
-    await game.persist_flush()
-    await ctx.send(f"{ctx.author.mention} joined! Total players: {len(game.players)}." + _tag())
+    def join():
+        if game.in_progress or game.ending:
+            raise gameplay_state.Rejected("A game is already in progress!")
+        if ctx.author.id in [p.id for p in game.players]:
+            raise gameplay_state.Rejected("You are already on the waiting list!")
+        game.players.append(ctx.author)
+    try:
+        await gameplay_state.commit(game, join)
+        await ctx.send(f"{ctx.author.mention} joined! Total players: {len(game.players)}." + _tag())
+    except gameplay_state.Rejected as error:
+        await ctx.send(str(error))
 
 
 @bot.command(name="leave")
 @commands.guild_only()
 async def leave_game_command(ctx: commands.Context) -> None:
-    """
-    Leave the join queue (lobby) if a game hasn't started yet.
-    """
     game = get_game_for_guild(ctx.guild.id, allowed_guild_id=ALLOWED_GUILD_ID)
-    if game.in_progress:
-        return await ctx.send("The game has already started; leaving the queue is not available." + _tag())
-
-    if ctx.author.id not in [p.id for p in game.players]:
-        return await ctx.send("You are not in the join queue. Use `!join` to enter." + _tag())
-
-    game.players = [p for p in game.players if p.id != ctx.author.id]
-    # Keep lobby persisted so restarts don't resurrect removed players.
-    await game.persist_flush()
-    await ctx.send(f"{ctx.author.mention} left the queue. Total players: {len(game.players)}." + _tag())
+    def leave():
+        if game.in_progress or game.ending:
+            raise gameplay_state.Rejected("The game has already started; leaving the queue is not available.")
+        if ctx.author.id not in [p.id for p in game.players]:
+            raise gameplay_state.Rejected("You are not in the join queue. Use !join to enter.")
+        game.players = [p for p in game.players if p.id != ctx.author.id]
+    try:
+        await gameplay_state.commit(game, leave)
+        await ctx.send(f"{ctx.author.mention} left the queue. Total players: {len(game.players)}." + _tag())
+    except gameplay_state.Rejected as error:
+        await ctx.send(str(error))
 
 
 @bot.command(name='players')
@@ -955,9 +907,28 @@ async def show_players_command(ctx: commands.Context) -> None:
 @commands.check(enforce_allowed_guild_check)
 async def startgame(ctx: commands.Context) -> None:
     game = get_game_for_guild(ctx.guild.id, allowed_guild_id=ALLOWED_GUILD_ID)
+    async with game._startup_lock:
+        try:
+            await _startgame(ctx, game)
+        except gameplay_state.Rejected as error:
+            await ctx.send(str(error))
+
+
+async def _startgame(ctx, game):
     if game.in_progress:
         return await ctx.send("A game is already in progress!")
 
+    # Keep recovered endgame markers until their statistics are committed;
+    # starting a new match must not overwrite the previous match's snapshot.
+    from game_recovery import _pending_endgame_meta, disk_recovery_blocked_reason
+    if _pending_endgame_meta(game.guild_id):
+        if not Game.commit_pending_endgame_if_any(game.guild_id):
+            return await ctx.send('Previous match statistics are pending. Repair or retry recovery before starting a new game.')
+    blocked = disk_recovery_blocked_reason(game.guild_id)
+    if blocked:
+        return await ctx.send(blocked)
+
+    expected_roster = tuple(p.id for p in game.players)
     valid_players = []
     for p in game.players:
         member = await game.get_member_safe(ctx.guild, p.id)
@@ -967,7 +938,13 @@ async def startgame(ctx: commands.Context) -> None:
     if len(valid_players) != len(game.players):
         await ctx.send(f"⚠️ Removed {len(game.players) - len(valid_players)} player(s) who left before the game started.")
 
-    game.players = valid_players
+    def refresh_lobby():
+        if (active_games.get(game.guild_id) is not game or game.in_progress or game.ending
+                or tuple(p.id for p in game.players) != expected_roster):
+            raise gameplay_state.Rejected('The lobby changed during startup. Run !startgame again.')
+        game.players = valid_players
+        return tuple(p.id for p in game.players)
+    expected_roster = await gameplay_state.commit(game,refresh_lobby)
     player_count = len(game.players)
 
     if player_count < 5:
@@ -1011,97 +988,91 @@ async def startgame(ctx: commands.Context) -> None:
                 players_can_view = perms_default.view_channel
 
             if isinstance(day_tc, discord.TextChannel) and bot_can_send and players_can_view:
-                game.game_channel_id = day_tc.id
+                announcement_channel_id = day_tc.id
                 if day_tc.id != ctx.channel.id:
                     await ctx.send(f"✅ Game channels ready. Use {day_tc.mention} for day chat and announcements.")
             else:
-                game.game_channel_id = ctx.channel.id
+                announcement_channel_id = ctx.channel.id
         except discord.HTTPException:
-            game.game_channel_id = ctx.channel.id
+            announcement_channel_id = ctx.channel.id
     else:
-        game.game_channel_id = ctx.channel.id
+        announcement_channel_id = ctx.channel.id
 
-    if player_count <= 6:
-        town_weights = [("Doctor", 8), ("Sheriff", 8), ("Investigator", 6), ("Lookout", 7), ("Tracker", 7), ("Escort", 7), ("Vigilante", 6), ("Retributionist", 3)]
-        mafia_support_weights = [("Gravedigger", 8), ("Consort", 7), ("Framer", 6)]
-        neutral_pool = ["Jester", "Executioner", "Survivor"]
-    else:
-        town_weights = [("Doctor", 8), ("Sheriff", 8), ("Investigator", 6), ("Lookout", 7), ("Tracker", 7), ("Escort", 7), ("Bodyguard", 6), ("Vigilante", 6), ("Scary Grandma", 5), ("Transporter", 4), ("Mayor", 3), ("Retributionist", 3)]
-        mafia_support_weights = [("Gatekeeper", 8), ("Consort", 8), ("Framer", 7), ("Gravedigger", 6), ("Hypnotist", 5), ("Mole", 5), ("Tailor", 4)]
-        neutral_pool = ["Jester", "Executioner", "Survivor", "Witch", "Pirate", "Arsonist", "Chaos"]
+    roles_for_this_game = game_roles.draw_roles_for_startgame(player_count, rng=random)
 
-        # Make Witch slightly rarer than other neutrals (small nudge, not a hard ban).
-        # This preserves the overall neutral mix while trimming Witch frequency.
-        if "Witch" in neutral_pool and random.random() < 0.50:
-            neutral_pool.remove("Witch")
-
-    num_mafia, num_neutral = ((1, 1) if player_count <= 6 else (2, 1) if player_count <= 9 else (3, 2) if player_count <= 12 else (4, 2))
-    num_town = player_count - num_mafia - num_neutral
-
-    if (player_count - num_mafia) <= 1 and "Executioner" in neutral_pool:
-        neutral_pool.remove("Executioner")
-
-    def get_weighted_roles(pool, count):
-        selected, names, weights = [], [r for r, _ in pool], [w for _, w in pool]
-        for _ in range(count):
-            if not names:
-                break
-            chosen = random.choices(names, weights=weights, k=1)[0]
-            selected.append(chosen)
-            idx = names.index(chosen)
-            names.pop(idx)
-            weights.pop(idx)
-        return selected
-
-    random.shuffle(neutral_pool)
-    chosen_neutrals, killing_count, disruptive_count = [], 0, 0
-    for r in neutral_pool:
-        if len(chosen_neutrals) == num_neutral:
-            break
-        if r in ["Arsonist", "Pirate"]:
-            if killing_count < 1:
-                killing_count += 1
-                chosen_neutrals.append(r)
-        elif r in ["Witch", "Executioner"]:
-            if disruptive_count < 1:
-                disruptive_count += 1
-                chosen_neutrals.append(r)
-        else:
-            chosen_neutrals.append(r)
-
-    roles_for_this_game = chosen_neutrals + get_weighted_roles(town_weights, num_town) + (["Mobster"] + get_weighted_roles(mafia_support_weights, num_mafia - 1) if num_mafia > 0 else [])
-
-    if len(roles_for_this_game) != player_count:
-        return await ctx.send(f"⚠️ Role list mismatch ({len(roles_for_this_game)} roles for {player_count} players). Game not started.")
-
-    # Hard guardrail: this ruleset assumes no duplicate roles.
-    dupes = sorted({r for r in roles_for_this_game if roles_for_this_game.count(r) > 1})
-    if dupes:
-        return await ctx.send(f"🛑 Duplicate roles generated (not allowed): {', '.join(dupes)}. Game not started.")
-
-    random.shuffle(game.players)
-    game.living_players = game.players.copy()
-    # Stable targeting numbers: these should NOT shift when the living list order changes.
-    game.player_slots = {p.id: i + 1 for i, p in enumerate(game.players)}
     random.shuffle(roles_for_this_game)
 
-    game.player_roles = {p.id: r for p, r in zip(game.players, roles_for_this_game)}
-    game.in_progress = True
-    game.phase = "day"
-    game.day_number = 1
-    # Persisted idempotency key for history/stat commits.
-    # Stored on the Game object (not in role_states) to keep from_persisted() int-key coercion safe.
-    game.started_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-    game.game_key = f"{ctx.guild.id}:{game.started_at}:{secrets.token_hex(8)}"
-    # Endgame stats commit must be per-game idempotent; reset between games.
-    game.stats_committed = False
-    # Clear any stale per-game state from aborted runs.
-    game.resolving = False
-    game.vote_in_progress = False
-    game.votes_today = 0
-    game.graveyard = []
-    game.night_actions, game.role_states, game.doused_players = {}, {}, set()
+    def initialize_game():
+        if (active_games.get(game.guild_id) is not game or game.in_progress or game.ending
+                or tuple(p.id for p in game.players) != expected_roster):
+            raise gameplay_state.Rejected('A game is already starting.')
+        random.shuffle(game.players)
+        game.living_players = game.players.copy()
+        # Stable targeting numbers: these should NOT shift when the living list order changes.
+        game.player_slots = {p.id: i + 1 for i, p in enumerate(game.players)}
+        game.player_roles = {p.id: r for p, r in zip(game.players, roles_for_this_game)}
+        game.game_channel_id = announcement_channel_id
+        game.in_progress = True
+        game.phase = "day"
+        game.day_number = 1
+        # Persisted idempotency key for history/stat commits.
+        # Stored on the Game object (not in role_states) to keep from_persisted() int-key coercion safe.
+        game.started_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        game.game_key = f"{ctx.guild.id}:{game.started_at}:{secrets.token_hex(8)}"
+        # Endgame stats commit must be per-game idempotent; reset between games.
+        game.stats_committed = False
+        # Clear any stale per-game state from aborted runs.
+        game.resolving = False
+        game.vote_in_progress = False
+        game.votes_today = 0
+        game.graveyard = []
+        game.night_actions, game.role_states, game.doused_players = {}, {}, set()
 
+        game.gameplay = {"version": 1, "trial": None, "panels": {}, "night_token": None, "deaths": {}}
+        for p_id, role in game.player_roles.items():
+            state: Dict = {}
+            if role == "Vigilante":    state = {"shots_remaining": 1, "will_die_of_guilt": False, "guilty_tomorrow": False}
+            elif role == "Gravedigger": state = {"uses_remaining": 1}
+            elif role == "Survivor":   state = {"vests_remaining": role_starting_charges(player_count=player_count)}
+            elif role == "Mayor":      state = {"is_revealed": False}
+            elif role == "Doctor":     state = {"self_heals_remaining": 1}
+            elif role == "Bodyguard":  state = {"uses_remaining": 1, "self_protects_remaining": 1}
+            elif role == "Witch":      state = {"has_learned_role": False, "night1_shield_used": False}
+            elif role == "Gatekeeper": state = {"uses_remaining": role_starting_charges(player_count=player_count)}
+            elif role == "Scary Grandma": state = {"alerts_remaining": role_starting_charges(player_count=player_count)}
+            elif role == "Mole":       state = {"uses_remaining": 1}
+            elif role == "Tailor":     state = {"uses_remaining": 1}
+            elif role == "Pirate":     state = {"wins": 0}
+            elif role == "Retributionist": state = {"uses_remaining": role_starting_charges(player_count=player_count), "used_corpses": []}
+            elif role == "Chaos":      state = {"uses_remaining": chaos_starting_uses(player_count), "night1_shield_used": False}
+            elif role == "Deputy": state = {"deputy_shots_remaining": 1, "deputy_fired_day": 0}
+            elif role == "Seer": state = {"seer_pair_history": []}
+            elif role == "Serial Killer": state = {"sk_cautious": False, "sk_target_id": None}
+            elif role == "Guardian Angel": state = {"ga_ward_charges": 1, "ga_defeated": False}
+            elif role == "Executioner":
+                # ToS-like: target starts as a Town role; exclude Mayor (and self).
+                targets = [
+                    p.id for p in game.players
+                    if p.id != p_id and game.player_roles.get(p.id) in TOWN_ROLES and game.player_roles.get(p.id) != "Mayor"
+                ]
+                if targets:
+                    state = {"exe_target": random.choice(targets)}
+                else:
+                    game.player_roles[p_id] = "Jester"
+                    state = {"can_haunt": False}
+
+            if state:
+                game.role_states[p_id] = state
+
+            # Snapshot role_start for honest history/role leaderboards (survives promotions/conversions).
+            game.role_states.setdefault(p_id, {})["role_start"] = role
+
+        for ga_id, role in game.player_roles.items():
+            if role == "Guardian Angel":
+                pool = guardian_angel_bind_pool_ids([p.id for p in game.players], ga_id)
+                if pool:
+                    game.role_states[ga_id]["ga_target_id"] = int(random.choice(pool))
+    await gameplay_state.commit(game, initialize_game)
     alive_role = ctx.guild.get_role(game.alive_role_id) if game.alive_role_id else None
     playing_role = ctx.guild.get_role(PLAYING_ROLE_ID)
     lockdown_role = ctx.guild.get_role(game.lockdown_role_id) if getattr(game, "lockdown_role_id", None) else None
@@ -1110,36 +1081,6 @@ async def startgame(ctx: commands.Context) -> None:
         player = await game.get_member_safe(ctx.guild, p_id)
         if not player:
             continue
-
-        state: Dict = {}
-        if role == "Vigilante":    state = {"shots_remaining": 1, "will_die_of_guilt": False, "guilty_tomorrow": False}
-        elif role == "Gravedigger": state = {"uses_remaining": 1}
-        elif role == "Survivor":   state = {"vests_remaining": 2}
-        elif role == "Mayor":      state = {"is_revealed": False}
-        elif role == "Doctor":     state = {"self_heals_remaining": 1}
-        elif role == "Bodyguard":  state = {"uses_remaining": 1, "self_protects_remaining": 1}
-        elif role == "Witch":      state = {"has_learned_role": False, "night1_shield_used": False}
-        elif role == "Gatekeeper": state = {"uses_remaining": 2}
-        elif role == "Scary Grandma": state = {"alerts_remaining": 2}
-        elif role == "Mole":       state = {"uses_remaining": 1}
-        elif role == "Tailor":     state = {"uses_remaining": 1}
-        elif role == "Pirate":     state = {"wins": 0}
-        elif role == "Retributionist": state = {"uses_remaining": 2, "used_corpses": []}
-        elif role == "Chaos":      state = {"uses_remaining": 2}
-        elif role == "Executioner":
-            # ToS-like: target starts as a Town role; exclude Mayor (and self).
-            targets = [
-                p.id for p in game.players
-                if p.id != p_id and game.player_roles.get(p.id) in TOWN_ROLES and game.player_roles.get(p.id) != "Mayor"
-            ]
-            if targets:
-                state = {"exe_target": random.choice(targets)}
-
-        if state:
-            game.role_states[p_id] = state
-
-        # Snapshot role_start for honest history/role leaderboards (survives promotions/conversions).
-        game.role_states.setdefault(p_id, {})["role_start"] = role
 
         if alive_role:
             try:
@@ -1163,8 +1104,7 @@ async def startgame(ctx: commands.Context) -> None:
                 except discord.HTTPException:
                     pass
 
-    # Persist after roles/role-states/Playing/Alive have been applied (restart-safe) before durable DM enqueue.
-    await game.persist_flush()
+    # Role state was committed before Discord delivery; outbox entries are deduplicated.
 
     db = getattr(bot, "db", None)
     for p_id, role in game.player_roles.items():
@@ -1211,6 +1151,19 @@ async def startgame(ctx: commands.Context) -> None:
             except discord.HTTPException:
                 await ctx.send(f"⚠️ Could not DM {player.mention} — they may have DMs disabled.")
 
+        from roles import role_start_dm_supplements
+        bind_slot = game.player_slots.get(state.get('ga_target_id'))
+        for kind, content in role_start_dm_supplements(role, bind_slot=bind_slot):
+            if db:
+                db.enqueue_dm_outbox(guild_id=ctx.guild.id, kind=kind,
+                    dedupe_key=f'mafia_{kind}:{ctx.guild.id}:{game.game_key}:{p_id}',
+                    target_user_id=p_id, content=content)
+            else:
+                try:
+                    await player.send(content)
+                except discord.HTTPException:
+                    await ctx.send(f'Could not deliver role instructions to {player.mention}.')
+
     await ctx.send(f"**Game Started!** Roles have been assigned secretly. It is now **Day 1**.")
     logging.info(f"Game started on guild {ctx.guild.id} with {player_count} players.")
 
@@ -1255,158 +1208,14 @@ async def day(ctx: commands.Context) -> None:
 @commands.check(enforce_allowed_guild_check)
 async def resolve(ctx: commands.Context) -> None:
     game = get_game_for_guild(ctx.guild.id, allowed_guild_id=ALLOWED_GUILD_ID)
-    if not game.in_progress or game.phase != "night":
-        return await ctx.send("This can only be used during the night phase.")
-
-    # Prevent resolving while Pirate duels are still running.
-    pending_duels = [
-        a for a in game.night_actions.values()
-        if a.get("type") == "plunder" and not a.get("duel_finished", False)
-    ]
-    if pending_duels:
-        return await ctx.send("⚔️ A Pirate duel is still in progress. Please wait for it to finish before resolving the night.")
-
-    if game.resolving:
-        return await ctx.send("Resolution is already in progress.")
-    game.resolving = True
     try:
-        await ctx.send("The sun begins to rise...")
-        if not game.in_progress:
-            return
-
-        # Expand special actions (Retributionist) into normal engine actions.
-        # Chaos is resolved inside engine/night.py as the single source of truth.
-        for actor_id, action in list(game.night_actions.items()):
-            a_type = action.get("type")
-            if a_type == "reanimate":
-                corpse_role = action.get("corpse_role")
-                corpse_pid = action.get("corpse_player_id")
-                if not corpse_role or corpse_pid is None:
-                    continue
-                # Map corpse role to an engine action.
-                if corpse_role == "Doctor":
-                    game.night_actions[actor_id] = {"type": "heal", "target": action.get("target"), "actor": actor_id, "_from_retri": corpse_pid}
-                elif corpse_role in {"Sheriff", "Investigator"}:
-                    game.night_actions[actor_id] = {"type": "investigate", "target": action.get("target"), "role": corpse_role, "actor": actor_id, "_from_retri": corpse_pid}
-                elif corpse_role == "Lookout":
-                    game.night_actions[actor_id] = {"type": "watch", "target": action.get("target"), "actor": actor_id, "_from_retri": corpse_pid}
-                elif corpse_role == "Tracker":
-                    game.night_actions[actor_id] = {"type": "track", "target": action.get("target"), "actor": actor_id, "_from_retri": corpse_pid}
-                elif corpse_role == "Escort":
-                    game.night_actions[actor_id] = {"type": "roleblock", "target": action.get("target"), "actor": actor_id, "_from_retri": corpse_pid}
-                elif corpse_role == "Transporter":
-                    game.night_actions[actor_id] = {"type": "transport", "targets": action.get("targets", []), "actor": actor_id, "_from_retri": corpse_pid}
-                elif corpse_role == "Vigilante":
-                    game.night_actions[actor_id] = {"type": "shoot", "target": action.get("target"), "actor": actor_id, "_from_retri": corpse_pid}
-                elif corpse_role == "Bodyguard":
-                    game.night_actions[actor_id] = {"type": "ret_protect", "target": action.get("target"), "actor": actor_id, "_from_retri": corpse_pid}
-
-        visit_log, blocked, healed_by_map, protected_by_map, deaths = await run_night_pipeline(game, ctx.guild)
-
-        # Consume Chaos / Retributionist uses only if not blocked AND the expanded action actually applied.
-        # (Important for revealed-Mayor heal rule: skipped heals should not burn uses/corpses.)
-        for actor_id, action in list(game.night_actions.items()):
-            if actor_id in blocked:
-                continue
-
-            a_type = action.get("type")
-
-            def _heal_applied() -> bool:
-                tgt = action.get("target")
-                if tgt is None:
-                    return False
-                return healed_by_map.get(tgt) == actor_id
-
-            applied = True
-            if a_type == "heal":
-                applied = _heal_applied()
-            elif a_type == "roleblock":
-                # Consider the roleblock "applied" only if the target actually ended up blocked.
-                tgt = action.get("target")
-                applied = (tgt is not None) and (tgt in blocked)
-
-            if not applied:
-                continue
-
-            corpse_pid = action.get("_from_retri")
-            if corpse_pid is not None and game.player_roles.get(actor_id) == "Retributionist":
-                s = game.role_states.setdefault(actor_id, {})
-                s["uses_remaining"] = max(0, int(s.get("uses_remaining", 0)) - 1)
-                used = s.setdefault("used_corpses", [])
-                if corpse_pid not in used:
-                    used.append(corpse_pid)
-                for entry in game.graveyard:
-                    if entry.get("player_id") == corpse_pid:
-                        entry["used_by_retri"] = True
-                        break
-
-        # deaths from run_night_pipeline() already includes night kills.
-        deaths = set(deaths)
-        night_kill_deaths = set(deaths)
-
-        # Night feedback already sent inside run_night_pipeline().
-
-        await game.sync_living_players(ctx.guild)
-        living_ids = await game.get_living_ids(ctx.guild)
-
-        # Vigilante guilt timing: convert pending guilt markers BEFORE tallying guilt deaths for this resolve.
-        for _p_id, s in list(game.role_states.items()):
-            if s.get("guilty_tomorrow"):
-                s["will_die_of_guilt"] = True
-                s["guilty_tomorrow"] = False
-
-        guilty_vigs = [
-            p_id
-            for p_id, s in game.role_states.items()
-            if s.get("will_die_of_guilt") and p_id in living_ids and p_id not in night_kill_deaths
-        ]
-        deaths.update(guilty_vigs)
-
-        # Jester haunt fallback (ToS-like): if a lynched Jester didn't pick, haunt a random eligible voter.
-        for _j_id, s in list(game.role_states.items()):
-            if not s.get("can_haunt"):
-                continue
-            if "haunt_target" in s:
-                continue
-            eligible = [vid for vid in s.get("guilty_voters", []) if vid in living_ids]
-            if eligible:
-                s["haunt_target"] = random.choice(eligible)
-                s["can_haunt"] = False
-
-        jester_haunts = [s["haunt_target"] for s in game.role_states.values() if "haunt_target" in s]
-        deaths.update(jester_haunts)
-
-        for _p_id, s in list(game.role_states.items()):
-            s.pop("haunt_target", None)
-
-        if not deaths:
-            await ctx.send("The night was surprisingly peaceful. No one has died.")
+        record = game.gameplay.get("resolution")
+        if game.phase == "night" and record and record.get("applied") and not record.get("progressed"):
+            await resolution.finish(game, ctx)
         else:
-            for p_id in set(deaths):
-                player = await game.get_member_safe(ctx.guild, p_id)
-                if p_id in jester_haunts:
-                    cause = "haunt"
-                    custom = f"👻 The Jester's spirit has claimed its revenge! **<@{p_id}>** was found dead."
-                elif p_id in guilty_vigs:
-                    cause = "guilt"
-                    custom = f"Overcome with guilt, <@{p_id}> took their own life."
-                else:
-                    cause = "night_kill"
-                    custom = None
-
-                if player:
-                    await game.process_death(ctx, player, cause, custom_message=custom)
-                else:
-                    await game.process_death_by_id(ctx, ctx.guild, p_id, cause, custom_message=custom)
-
-        if await game.check_win_conditions():
-            return
-        await game.start_day(ctx)
-    finally:
-        game.resolving = False
-        # Don't resurrect persisted state after `reset()` has deleted it.
-        if game.in_progress and not getattr(game, "ending", False):
-            await game.persist_flush()
+            await resolution.run(game, ctx)
+    except gameplay_state.Rejected as error:
+        await ctx.send(str(error))
 
 
 @bot.command()
@@ -1427,6 +1236,7 @@ async def status(ctx: commands.Context) -> None:
         "Mobster", "Doctor", "Escort", "Consort", "Sheriff", "Investigator", "Framer", "Gravedigger", "Vigilante",
         "Transporter", "Bodyguard", "Lookout", "Tracker", "Witch", "Arsonist", "Hypnotist", "Mole", "Tailor", "Pirate", "Gatekeeper", "Survivor", "Scary Grandma",
         "Retributionist", "Chaos",
+        "Serial Killer", "Seer", "Guardian Angel",
     }
 
     for p_id, role in game.player_roles.items():
@@ -1662,32 +1472,81 @@ async def _complete_tribunal_after_defense(
         await channel.send(f"The town has spared **{defendant.display_name}**. They step down from the stand.")
 
 
-async def _resume_tribunal_defense_after_restart(guild: discord.Guild, remaining: float) -> None:
-    """Sleep remaining defense time then continue tribunal (B4 resume path)."""
-    await asyncio.sleep(max(0.0, remaining))
-    game = active_games.get(ALLOWED_GUILD_ID)
-    if not game or not game.vote_in_progress:
-        return
-    if getattr(game, "tribunal_subphase", None) != "defense":
-        return
-    ch = bot.get_channel(game.game_channel_id)
-    if not isinstance(ch, discord.TextChannel):
-        return
-    did = getattr(game, "tribunal_defendant_id", None)
-    if not did:
-        return
-    defendant = await game.get_member_safe(guild, int(did))
-    if not defendant:
-        return
-    alive_role = guild.get_role(game.alive_role_id) if game.alive_role_id else None
-    stand_role = guild.get_role(game.stand_role_id) if game.stand_role_id else None
-    day_vc = guild.get_channel(game.day_vc_id) if game.day_vc_id else None
-    current_day = game.day_number
+async def _cleanup_tribunal(game: Game, guild: discord.Guild, current_day: int) -> None:
+    """Shared finalizer for live and restarted trials, including failed trials."""
+    defendant_id = game.tribunal_defendant_id
+    game.vote_in_progress = False
+    game.tribunal_muted = False
+    game.tribunal_defendant_id = None
+    game.tribunal_defense_deadline_utc = None
+    game.tribunal_judgment_deadline_utc = None
+    game.tribunal_judgment_message_id = None
+    game.tribunal_subphase = None
+    game.tribunal_verdict_committed = False
     try:
-        await ch.send("⚖️ **Trial resumed** after bot restart — continuing where the defense phase left off.")
-    except discord.HTTPException:
-        pass
-    await _complete_tribunal_after_defense(ch, game, defendant, current_day, alive_role, stand_role, day_vc)
+        if game.in_progress and not getattr(game, "ending", False):
+            await game.persist_flush()
+    except Exception:
+        logging.exception("Failed to persist tribunal cleanup for guild %s.", guild.id)
+
+    stand_role = guild.get_role(game.stand_role_id) if game.stand_role_id else None
+    if defendant_id and stand_role:
+        try:
+            defendant = await game.get_member_safe(guild, defendant_id)
+            if defendant:
+                await defendant.remove_roles(stand_role)
+        except discord.HTTPException:
+            pass
+    if game.is_active("day") and game.day_number == current_day:
+        day_vc = guild.get_channel(game.day_vc_id) if game.day_vc_id else None
+        alive_role = guild.get_role(game.alive_role_id) if game.alive_role_id else None
+        if day_vc and alive_role:
+            try:
+                await day_vc.set_permissions(alive_role, speak=True)
+            except discord.HTTPException:
+                pass
+
+
+async def _resume_tribunal_defense_after_restart(guild: discord.Guild, remaining: float) -> None:
+    """Continue this restored trial, then release its vote/permission locks."""
+    game = active_games.get(ALLOWED_GUILD_ID)
+    if not game or not game.vote_in_progress or game.tribunal_subphase != "defense":
+        return
+    current_day = game.day_number
+    defendant_id = game.tribunal_defendant_id
+    deadline = game.tribunal_defense_deadline_utc
+
+    def owns_trial() -> bool:
+        return (
+            active_games.get(ALLOWED_GUILD_ID) is game
+            and game.day_number == current_day
+            and game.tribunal_defendant_id == defendant_id
+        )
+
+    try:
+        await asyncio.sleep(max(0.0, remaining))
+        if not owns_trial() or not game.is_active("day") or not game.vote_in_progress:
+            return
+        if game.tribunal_subphase != "defense" or game.tribunal_defense_deadline_utc != deadline:
+            return
+        ch = bot.get_channel(game.game_channel_id)
+        if not isinstance(ch, discord.TextChannel) or not defendant_id:
+            return
+        defendant = await game.get_member_safe(guild, int(defendant_id))
+        if not defendant:
+            return
+        alive_role = guild.get_role(game.alive_role_id) if game.alive_role_id else None
+        stand_role = guild.get_role(game.stand_role_id) if game.stand_role_id else None
+        day_vc = guild.get_channel(game.day_vc_id) if game.day_vc_id else None
+        try:
+            await ch.send("⚖️ **Trial resumed** after bot restart — continuing where the defense phase left off.")
+        except discord.HTTPException:
+            pass
+        await _complete_tribunal_after_defense(ch, game, defendant, current_day, alive_role, stand_role, day_vc)
+    finally:
+        # A reset/new match must not be cleaned up by an obsolete resume task.
+        if owns_trial():
+            await _cleanup_tribunal(game, guild, current_day)
 
 
 @bot.command()
@@ -1695,170 +1554,12 @@ async def _resume_tribunal_defense_after_restart(guild: discord.Guild, remaining
 @commands.check(enforce_allowed_guild_check)
 async def vote(ctx: commands.Context, target_number: Optional[int] = None) -> None:
     game = get_game_for_guild(ctx.guild.id, allowed_guild_id=ALLOWED_GUILD_ID)
-    if not game.in_progress or game.phase != "day":
-        return
-
-    is_gm = any(r.id == GAME_OVERSEER_ROLE_ID for r in ctx.author.roles)
-    if target_number:
-        # Non-GMs get a simple hint; don't do any lookups.
-        if not is_gm:
-            return await ctx.send("*(Use the Game Overseer's `!vote` command to run the Tribunal.)*")
-        target = await game.get_target_from_input(ctx, target_number)
-        if target:
-            await ctx.send("*(Use the Tribunal UI to cast votes.)*")
-        return
-
-    if not is_gm:
-        return await ctx.send("Only the Game Overseer can initiate the Tribunal!")
-
-    if game.votes_today >= VOTE_LIMIT_PER_DAY:
-        return await ctx.send("🛑 **The town is exhausted.** No more trials today.")
-    if game.vote_in_progress:
-        return await ctx.send("A vote is already underway!")
-
-    alive_role = ctx.guild.get_role(game.alive_role_id) if game.alive_role_id else None
-    stand_role = ctx.guild.get_role(game.stand_role_id) if game.stand_role_id else None
-    day_vc = ctx.guild.get_channel(game.day_vc_id) if game.day_vc_id else None
-
-    current_day = game.day_number
-
+    if target_number is not None:
+        return await ctx.send("Use the Tribunal controls to cast nominations.")
     try:
-        game.vote_in_progress = True
-
-        await game.sync_living_players(ctx.guild)
-        living_ids = await game.get_living_ids(ctx.guild)
-        emojis = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟","🇦","🇧","🇨","🇩","🇪"]
-        ordered_living = game.ordered_living_players()
-        nominees = {emojis[i]: p for i, p in enumerate(ordered_living) if i < len(emojis)}
-
-        embed = discord.Embed(
-            title="⚖️ NOMINATION PHASE ⚖️",
-            description=f"Vote to put someone on trial. ({VOTE_DURATION} seconds)",
-            color=discord.Color.dark_gold()
-        )
-        embed.add_field(
-            name="Living Players",
-            value="\n".join(
-                [
-                    f"{e} — #{game.player_slots.get(p.id, '?')} {p.mention} ({p.display_name})"
-                    for e, p in nominees.items()
-                ]
-            ),
-            inline=False
-        )
-
-        poll = await ctx.send(embed=embed)
-        try:
-            for e in nominees:
-                await poll.add_reaction(e)
-        except (discord.Forbidden, discord.HTTPException):
-            return await ctx.send("🛑 I couldn't add reactions here. Check my permissions (Add Reactions) and try again.")
-
-        await asyncio.sleep(VOTE_DURATION)
-
-        if not game.is_active("day") or not game.vote_in_progress or game.day_number != current_day:
-            return
-
-        try:
-            poll = await ctx.channel.fetch_message(poll.id)
-        except discord.NotFound:
-            return
-
-        # Refresh living list before tally (admins may slay, users may leave).
-        await game.sync_living_players(ctx.guild)
-        living_ids = await game.get_living_ids(ctx.guild)
-
-        ordered_living2 = game.ordered_living_players()
-        votes = {p: 0 for p in ordered_living2}
-        user_nomination_votes: Dict[int, Optional[discord.Member]] = {}
-        user_nomination_multi: Set[int] = set()
-        voters_map = {p: [] for p in ordered_living2}
-
-        for reaction in poll.reactions:
-            if reaction.emoji not in nominees:
-                continue
-            target = nominees[reaction.emoji]
-            async for user in reaction.users():
-                if user.id != bot.user.id and user.id in living_ids and user.id != target.id:
-                    if user.id in user_nomination_multi:
-                        continue
-                    if user.id not in user_nomination_votes:
-                        user_nomination_votes[user.id] = target
-                    else:
-                        # Reacted to multiple nominees -> invalid/abstain for nomination.
-                        user_nomination_multi.add(user.id)
-                        user_nomination_votes[user.id] = None
-
-        for uid, target in user_nomination_votes.items():
-            if target and target.id in living_ids and target in votes:
-                weight = 2 if game.role_states.get(uid, {}).get("is_revealed") else 1
-                votes[target] += weight
-                m = await game.get_member_safe(ctx.guild, uid)
-                if m:
-                    voters_map[target].append(m)
-
-        max_votes = max(votes.values()) if votes else 0
-        if max_votes == 0:
-            return await ctx.send("The town remains silent. No one is put on trial.")
-
-        top = [p for p, v in votes.items() if v == max_votes]
-        if len(top) > 1:
-            return await ctx.send("The nomination resulted in a tie! No one takes the stand.")
-
-        defendant = top[0]
-        game.votes_today += 1
-        await game.persist_flush()
-
-        await ctx.send(f"🚨 **{defendant.mention} has been voted to the stand!** 🚨\nThe town is now muted. You have **45 seconds** to defend yourself.")
-        game.tribunal_defendant_id = defendant.id
-        if day_vc and alive_role:
-            try:
-                await day_vc.set_permissions(alive_role, speak=False)
-            except discord.HTTPException:
-                pass
-            game.tribunal_muted = True
-            await game.persist_flush()
-
-        if stand_role:
-            try:
-                await defendant.add_roles(stand_role)
-            except discord.HTTPException:
-                pass
-
-        defense_end = (datetime.now(timezone.utc) + timedelta(seconds=45)).replace(microsecond=0)
-        game.tribunal_defense_deadline_utc = defense_end.isoformat()
-        game.tribunal_subphase = "defense"
-        game.tribunal_verdict_committed = False
-        await game.persist_flush()
-
-        await asyncio.sleep(45)
-        if not game.is_active("day") or not game.vote_in_progress or game.day_number != current_day:
-            return
-
-        await _complete_tribunal_after_defense(ctx.channel, game, defendant, current_day, alive_role, stand_role, day_vc)
-
-    finally:
-        # Always clear the in-progress flag to avoid getting "stuck" if phases change mid-trial.
-        game.vote_in_progress = False
-        game.tribunal_muted = False
-        game.tribunal_defendant_id = None
-        game.tribunal_defense_deadline_utc = None
-        game.tribunal_judgment_deadline_utc = None
-        game.tribunal_judgment_message_id = None
-        game.tribunal_subphase = None
-        game.tribunal_verdict_committed = False
-        # Best-effort persistence so a restart doesn't bypass vote limits.
-        try:
-            if game.in_progress and not getattr(game, "ending", False):
-                await game.persist_flush()
-        except Exception:
-            pass
-        if game.is_active("day") and game.day_number == current_day:
-            if day_vc and alive_role:
-                try:
-                    await day_vc.set_permissions(alive_role, speak=True)
-                except discord.HTTPException:
-                    pass
+        await bot.gameplay_controller.begin_trial(game, [r.id for r in ctx.author.roles], game.game_channel_id or ctx.channel.id,actor_id=ctx.author.id)
+    except gameplay_state.Rejected as error:
+        await ctx.send(str(error))
 
 
 # ==========================================
@@ -1930,10 +1631,14 @@ async def will(ctx: commands.Context, *, text: Optional[str] = None) -> None:
             pass
         return
 
-    state = game.role_states.setdefault(ctx.author.id, {})
+    state = game.role_states.get(ctx.author.id, {})
     if text is not None and text.strip().lower() == "clear":
-        state["will"] = ""
-        await game.persist_flush()
+        def clear():
+            gameplay_state.require_current(game)
+            if game.resolving:
+                raise gameplay_state.Rejected("Night is resolving. Please wait.")
+            game.role_states.setdefault(ctx.author.id, {})["will"] = ""
+        await gameplay_state.commit(game, clear)
         return await ctx.author.send("Cleared your will.")
 
     current = str(state.get("will", "") or "")
@@ -1942,7 +1647,7 @@ async def will(ctx: commands.Context, *, text: Optional[str] = None) -> None:
         "**Your Last Will:**\n"
         f"```{display[:1800]}```\n"
         "Use the button below to edit it."
-    , view=WillView(owner_id=ctx.author.id, current_text=current))
+    , view=WillView(game=game, owner_id=ctx.author.id, current_text=current))
 
 
 @bot.command()
@@ -2089,8 +1794,14 @@ async def reveal(ctx: commands.Context) -> None:
     if game.role_states.get(ctx.author.id, {}).get("is_revealed"):
         return await ctx.send("You have already revealed yourself!")
 
-    game.role_states.setdefault(ctx.author.id, {})["is_revealed"] = True
-    await game.persist_flush()
+    def reveal_mayor():
+        gameplay_state.require_current(game, phase="day")
+        if ctx.author.id not in {p.id for p in game.living_players} or game.player_roles.get(ctx.author.id) != "Mayor":
+            raise gameplay_state.Rejected("You cannot reveal now.")
+        if game.role_states.get(ctx.author.id,{}).get('is_revealed'):
+            raise gameplay_state.Rejected('You have already revealed yourself.')
+        game.role_states.setdefault(ctx.author.id, {})["is_revealed"] = True
+    await gameplay_state.commit(game, reveal_mayor)
     game_chan = bot.get_channel(game.game_channel_id)
     if game_chan:
         await game_chan.send(f"👑 **{ctx.author.mention} has revealed as the Mayor! Their vote now counts as two.**")
@@ -2116,7 +1827,12 @@ async def haunt(ctx: commands.Context, target_number: Optional[int] = None) -> N
     # Live eligible list: filter out voters who are now dead/left.
     eligible_voters = [vid for vid in stored_voters if vid in living_ids]
     if not eligible_voters:
-        game.role_states[ctx.author.id]["can_haunt"] = False
+        def exhausted():
+            gameplay_state.require_current(game)
+            if game.resolving:
+                raise gameplay_state.Rejected('Night is resolving. Please wait.')
+            game.role_states[ctx.author.id]['can_haunt'] = False
+        await gameplay_state.commit(game,exhausted)
         return await ctx.send("There are no eligible living voters left to haunt.")
 
     # Allow `!haunt` with no number to show the up-to-date list.
@@ -2136,44 +1852,87 @@ async def haunt(ctx: commands.Context, target_number: Optional[int] = None) -> N
     if not target or target.id not in living_ids:
         return await ctx.send("That player is already dead. Use `!haunt` to see the current eligible list.")
 
-    game.role_states.setdefault(ctx.author.id, {})["haunt_target"] = target_id
-    game.role_states[ctx.author.id]["can_haunt"] = False
-    await game.persist_flush()
-    await ctx.send(f"You have chosen to haunt **{target.display_name}**. Your soul may now rest.")
+    result = await gameplay_actions.submit(game, ctx.author.id, "haunt", (target_id,), guild=guild)
+    await ctx.send(result.message, allowed_mentions=NO_MENTIONS)
 
 # ==========================================
 # PLAYER NIGHT ACTION COMMANDS
 # ==========================================
+
+async def _submit_action_command(ctx, ability, slots=(), *, corpse_number=None, **options):
+    if getattr(ctx, "interaction", None) and not ctx.interaction.response.is_done():
+        await ctx.defer(ephemeral=True)
+    game = ctx.game
+    expected = gameplay_state.identity(game)
+    guild = ctx.guild or bot.get_guild(game.guild_id)
+    await game.sync_living_players(guild)
+    living = {game.player_slots.get(p.id): p.id for p in game.living_players}
+    if any(slot not in living for slot in slots):
+        return await ctx.send("Invalid or no longer living target seat.", ephemeral=True)
+    if corpse_number is not None:
+        corpses = gameplay_actions.usable_corpses(game, ctx.author.id)
+        if not 1 <= corpse_number <= len(corpses):
+            return await ctx.send("Invalid corpse number. Use !corpses for the current list.", ephemeral=True)
+        options['corpse_id'] = corpses[corpse_number-1]['player_id']
+    result = await gameplay_actions.submit(game, ctx.author.id, ability, tuple(living[slot] for slot in slots),
+        expected=expected, guild=guild, **options)
+    await ctx.send(result.message, ephemeral=True, allowed_mentions=NO_MENTIONS)
+    if result.accepted:
+        bot.gameplay_controller.after_submission(game, ctx.author.id, result.action)
+
+
+@bot.command(name="actions")
+async def actions_command(ctx):
+    game = get_game_by_player_id(ctx.author.id)
+    if not game:
+        return await ctx.send("No active game found for you.")
+    try:
+        await bot.gameplay_controller.reopen(game, ctx.author.id)
+        if ctx.guild:
+            await ctx.send("Your controls were sent privately.", allowed_mentions=NO_MENTIONS)
+    except gameplay_state.Rejected as error:
+        await ctx.send(str(error))
+    except discord.HTTPException:
+        await ctx.send("I couldn't deliver private controls. Enable DMs or use /actions.")
+
+
+@bot.tree.command(name="actions", description="Open your private night actions or outstanding duel")
+async def actions_slash(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    game = get_game_by_player_id(interaction.user.id)
+    try:
+        if not game or (interaction.guild and interaction.guild.id != game.guild_id):
+            raise gameplay_state.Rejected("No active game found for you in this server.")
+        await private_reply(interaction, "Your private controls", view=bot.gameplay_controller.panel_for(game, interaction.user.id))
+    except gameplay_state.Rejected as error:
+        await private_reply(interaction, str(error))
+
+
+@bot.tree.command(name="trial", description="Game Overseer: start the Tribunal")
+@discord.app_commands.guild_only()
+async def trial_slash(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        if interaction.guild.id != ALLOWED_GUILD_ID:
+            raise gameplay_state.Rejected("This bot is configured for another server.")
+        game = get_game_for_guild(interaction.guild.id, allowed_guild_id=ALLOWED_GUILD_ID)
+        await bot.gameplay_controller.begin_trial(game, [r.id for r in interaction.user.roles], game.game_channel_id or interaction.channel_id,actor_id=interaction.user.id)
+        await private_reply(interaction, "Nominations are open in the game channel.")
+    except gameplay_state.Rejected as error:
+        await private_reply(interaction, str(error))
+
+
 @bot.command()
 @commands.cooldown(1, 2, commands.BucketType.user)
 @only_during_night_gameplay()
 async def kill(ctx: commands.Context, target_number: int) -> None:
-    game = ctx.game
-    if game.player_roles.get(ctx.author.id) != "Mobster":
-        return
-    target = await game.get_target_from_input(ctx, target_number)
-    if not target:
-        return
-    await game.set_night_action(ctx, {"type": "kill", "target": target.id, "actor": ctx.author.id})
-    await ctx.send(f"Targeted **{target.display_name}**.")
+    await _submit_action_command(ctx, "kill", (target_number,))
 
 @bot.hybrid_command()
 @commands.cooldown(1, 2, commands.BucketType.user)
 @only_during_night_gameplay()
 async def heal(ctx: commands.Context, target_number: int) -> None:
-    game = ctx.game
-    if game.player_roles.get(ctx.author.id) != "Doctor":
-        return
-    target = await game.get_target_from_input(ctx, target_number, allow_self=True)
-    if not target:
-        return
-    if game.role_states.get(target.id, {}).get("is_revealed"):
-        return await ctx.send("Cannot heal a revealed Mayor!")
-    if target.id == ctx.author.id and game.role_states.get(ctx.author.id, {}).get("self_heals_remaining", 0) <= 0:
-        return await ctx.send("You have already used your self-heal!")
-
-    await game.set_night_action(ctx, {"type": "heal", "target": target.id, "actor": ctx.author.id})
-    await ctx.send(f"Healing **{target.display_name}**.")
+    await _submit_action_command(ctx, "heal", (target_number,))
 
 
 @heal.autocomplete("target_number")
@@ -2184,14 +1943,7 @@ async def heal_target_autocomplete(interaction: discord.Interaction, current: st
 @commands.cooldown(1, 2, commands.BucketType.user)
 @only_during_night_gameplay()
 async def roleblock(ctx: commands.Context, target_number: int) -> None:
-    game = ctx.game
-    if game.player_roles.get(ctx.author.id) not in ["Escort", "Consort"]:
-        return
-    target = await game.get_target_from_input(ctx, target_number)
-    if not target:
-        return
-    await game.set_night_action(ctx, {"type": "roleblock", "target": target.id, "actor": ctx.author.id})
-    await ctx.send(f"Targeted **{target.display_name}**.")
+    await _submit_action_command(ctx, "roleblock", (target_number,))
 
 
 @roleblock.autocomplete("target_number")
@@ -2202,18 +1954,7 @@ async def roleblock_target_autocomplete(interaction: discord.Interaction, curren
 @commands.cooldown(1, 2, commands.BucketType.user)
 @only_during_night_gameplay()
 async def investigate(ctx: commands.Context, target_number: int) -> None:
-    game = ctx.game
-    role = game.player_roles.get(ctx.author.id)
-    if role not in ["Sheriff", "Investigator", "Mole"]:
-        return
-    if role == "Mole" and game.role_states.get(ctx.author.id, {}).get("uses_remaining", 0) <= 0:
-        return await ctx.send("You have no investigations left.")
-
-    target = await game.get_target_from_input(ctx, target_number)
-    if not target:
-        return
-    await game.set_night_action(ctx, {"type": "investigate", "target": target.id, "role": role, "actor": ctx.author.id})
-    await ctx.send(f"Investigating **{target.display_name}**.")
+    await _submit_action_command(ctx, "investigate", (target_number,))
 
 
 @investigate.autocomplete("target_number")
@@ -2222,21 +1963,38 @@ async def investigate_target_autocomplete(interaction: discord.Interaction, curr
 
 @bot.hybrid_command()
 @commands.cooldown(1, 2, commands.BucketType.user)
-@only_during_night_gameplay()
 async def shoot(ctx: commands.Context, target_number: int) -> None:
-    game = ctx.game
-    if game.player_roles.get(ctx.author.id) != "Vigilante":
-        return
-    if game.role_states.get(ctx.author.id, {}).get("shots_remaining", 0) <= 0:
-        return await ctx.send("No bullets left!")
-    if game.role_states.get(ctx.author.id, {}).get("will_die_of_guilt"):
-        return await ctx.send("You are overcome with guilt.")
+    game = get_game_by_player_id(ctx.author.id)
+    if not game:
+        return await ctx.send('No active game found.')
+    if game.phase == 'night':
+        return await _vig_shoot_night(ctx, target_number)
+    from gameplay.deputy import fire
+    from gameplay.controller import channel_is_private
+    guild = ctx.guild or bot.get_guild(game.guild_id)
+    if guild is None or guild.id != game.guild_id:
+        return await ctx.send('The game server is unavailable.')
+    if ctx.guild is not None:
+        if not guild.chunked:
+            await guild.chunk(cache=True)
+        if not guild.chunked or not channel_is_private(ctx.channel, guild, ctx.author.id):
+            return await ctx.send('Use a verified private channel or DM for role actions.')
+    target = next((uid for uid, slot in game.player_slots.items() if slot == target_number), None)
+    try:
+        message, receipts = await fire(game, ctx.author.id, target, guild=guild)
+    except gameplay_state.Rejected as error:
+        return await ctx.send(str(error))
+    channel = guild.get_channel(game.game_channel_id)
+    if channel:
+        for receipt in receipts:
+            await game.deliver_death_receipt(channel, guild, receipt)
+    await ctx.send(message)
+    await game.check_win_conditions()
 
-    target = await game.get_target_from_input(ctx, target_number)
-    if not target:
-        return
-    await game.set_night_action(ctx, {"type": "shoot", "target": target.id, "actor": ctx.author.id})
-    await ctx.send(f"Aimed at **{target.display_name}**.")
+
+@only_during_night_gameplay()
+async def _vig_shoot_night(ctx, target_number):
+    return await _submit_action_command(ctx, 'shoot', (target_number,))
 
 
 @shoot.autocomplete("target_number")
@@ -2247,17 +2005,7 @@ async def shoot_target_autocomplete(interaction: discord.Interaction, current: s
 @commands.cooldown(1, 2, commands.BucketType.user)
 @only_during_night_gameplay()
 async def frame(ctx: commands.Context, target_number: int) -> None:
-    game = ctx.game
-    if game.player_roles.get(ctx.author.id) != "Framer":
-        return
-    if game.day_number > 2:
-        return await ctx.send("You can only frame on Nights 1 and 2.")
-
-    target = await game.get_target_from_input(ctx, target_number)
-    if not target:
-        return
-    await game.set_night_action(ctx, {"type": "frame", "target": target.id, "actor": ctx.author.id})
-    await ctx.send(f"Framing **{target.display_name}**.")
+    await _submit_action_command(ctx, "frame", (target_number,))
 
 
 @frame.autocomplete("target_number")
@@ -2268,34 +2016,13 @@ async def frame_target_autocomplete(interaction: discord.Interaction, current: s
 @commands.cooldown(1, 2, commands.BucketType.user)
 @only_during_night_gameplay()
 async def hide(ctx: commands.Context, target_number: int) -> None:
-    game = ctx.game
-    if game.player_roles.get(ctx.author.id) != "Gravedigger":
-        return
-    if game.role_states.get(ctx.author.id, {}).get("uses_remaining", 0) <= 0:
-        return await ctx.send("You have no uses remaining!")
-
-    target = await game.get_target_from_input(ctx, target_number)
-    if not target:
-        return
-    await game.set_night_action(ctx, {"type": "hide", "target": target.id, "actor": ctx.author.id})
-    await ctx.send(f"Concealing **{target.display_name}**.")
+    await _submit_action_command(ctx, "hide", (target_number,))
 
 @bot.hybrid_command()
 @commands.cooldown(1, 2, commands.BucketType.user)
 @only_during_night_gameplay()
 async def transport(ctx: commands.Context, target1_num: int, target2_num: int) -> None:
-    game = ctx.game
-    if game.player_roles.get(ctx.author.id) != "Transporter":
-        return
-    t1 = await game.get_target_from_input(ctx, target1_num, allow_self=True)
-    t2 = await game.get_target_from_input(ctx, target2_num, allow_self=True)
-    if not t1 or not t2:
-        return
-    if t1 == t2:
-        return await ctx.send("You must choose two different people.")
-
-    await game.set_night_action(ctx, {"type": "transport", "targets": [t1.id, t2.id], "actor": ctx.author.id})
-    await ctx.send(f"Swapping **{t1.display_name}** and **{t2.display_name}**.")
+    await _submit_action_command(ctx, "transport", (target1_num, target2_num))
 
 
 @transport.autocomplete("target1_num")
@@ -2311,25 +2038,7 @@ async def transport_t2_autocomplete(interaction: discord.Interaction, current: s
 @commands.cooldown(1, 2, commands.BucketType.user)
 @only_during_night_gameplay()
 async def protect(ctx: commands.Context, target_number: int) -> None:
-    game = ctx.game
-    if game.player_roles.get(ctx.author.id) != "Bodyguard":
-        return
-    target = await game.get_target_from_input(ctx, target_number, allow_self=True)
-    if not target:
-        return
-
-    state = game.role_states.get(ctx.author.id, {})
-    if target.id == ctx.author.id:
-        if state.get("self_protects_remaining", 0) <= 0:
-            return await ctx.send("You have already used your self-protection!")
-        await game.set_night_action(ctx, {"type": "bg_vest", "target": target.id, "actor": ctx.author.id})
-        return await ctx.send("Using a bulletproof vest tonight. 🦺")
-    else:
-        if state.get("uses_remaining", 0) <= 0:
-            return await ctx.send("You have already used your protection on someone else!")
-
-    await game.set_night_action(ctx, {"type": "protect", "target": target.id, "actor": ctx.author.id})
-    await ctx.send(f"Protecting **{target.display_name}** tonight.")
+    await _submit_action_command(ctx, "protect", (target_number,))
 
 
 @protect.autocomplete("target_number")
@@ -2340,15 +2049,7 @@ async def protect_target_autocomplete(interaction: discord.Interaction, current:
 @commands.cooldown(1, 2, commands.BucketType.user)
 @only_during_night_gameplay()
 async def watch(ctx: commands.Context, target_number: int) -> None:
-    game = ctx.game
-    if game.player_roles.get(ctx.author.id) != "Lookout":
-        return
-    target = await game.get_target_from_input(ctx, target_number)
-    if not target:
-        return
-
-    await game.set_night_action(ctx, {"type": "watch", "target": target.id, "actor": ctx.author.id})
-    await ctx.send(f"Watching **{target.display_name}** tonight.")
+    await _submit_action_command(ctx, "watch", (target_number,))
 
 
 @watch.autocomplete("target_number")
@@ -2359,15 +2060,7 @@ async def watch_target_autocomplete(interaction: discord.Interaction, current: s
 @commands.cooldown(1, 2, commands.BucketType.user)
 @only_during_night_gameplay()
 async def track(ctx: commands.Context, target_number: int) -> None:
-    game = ctx.game
-    if game.player_roles.get(ctx.author.id) != "Tracker":
-        return
-    target = await game.get_target_from_input(ctx, target_number)
-    if not target:
-        return
-
-    await game.set_night_action(ctx, {"type": "track", "target": target.id, "actor": ctx.author.id})
-    await ctx.send(f"Tracking **{target.display_name}** tonight.")
+    await _submit_action_command(ctx, "track", (target_number,))
 
 
 @track.autocomplete("target_number")
@@ -2378,16 +2071,7 @@ async def track_target_autocomplete(interaction: discord.Interaction, current: s
 @commands.cooldown(1, 2, commands.BucketType.user)
 @only_during_night_gameplay()
 async def control(ctx: commands.Context, target1_num: int, target2_num: int) -> None:
-    game = ctx.game
-    if game.player_roles.get(ctx.author.id) != "Witch":
-        return
-    t1 = await game.get_target_from_input(ctx, target1_num)
-    t2 = await game.get_target_from_input(ctx, target2_num)
-    if not t1 or not t2:
-        return
-
-    await game.set_night_action(ctx, {"type": "control", "targets": [t1.id, t2.id], "actor": ctx.author.id})
-    await ctx.send(f"Attempting to force **{t1.display_name}** to target **{t2.display_name}**.")
+    await _submit_action_command(ctx, "control", (target1_num, target2_num))
 
 
 @control.autocomplete("target1_num")
@@ -2403,15 +2087,7 @@ async def control_t2_autocomplete(interaction: discord.Interaction, current: str
 @commands.cooldown(1, 2, commands.BucketType.user)
 @only_during_night_gameplay()
 async def douse(ctx: commands.Context, target_number: int) -> None:
-    game = ctx.game
-    if game.player_roles.get(ctx.author.id) != "Arsonist":
-        return
-    target = await game.get_target_from_input(ctx, target_number, allow_self=False)
-    if not target:
-        return
-
-    await game.set_night_action(ctx, {"type": "douse", "target": target.id, "actor": ctx.author.id})
-    await ctx.send(f"Dousing **{target.display_name}**.")
+    await _submit_action_command(ctx, "douse", (target_number,))
 
 
 @douse.autocomplete("target_number")
@@ -2469,283 +2145,96 @@ async def corpses(ctx: commands.Context) -> None:
 @commands.cooldown(1, 2, commands.BucketType.user)
 @only_during_night_gameplay()
 async def reanimate(ctx: commands.Context, corpse_number: int, target1_num: int, target2_num: Optional[int] = None) -> None:
-    game = ctx.game
-    if game.player_roles.get(ctx.author.id) != "Retributionist":
-        return
-    state = game.role_states.get(ctx.author.id, {})
-    if state.get("uses_remaining", 0) <= 0:
-        return await ctx.send("You have no uses remaining.")
-
-    used_ids: Set[int] = set()
-    for x in (state.get("used_corpses") or []):
-        try:
-            used_ids.add(int(x))
-        except (TypeError, ValueError):
-            continue
-    usable = []
-    for entry in game.graveyard:
-        if entry.get("used_by_retri") or entry.get("is_hidden"):
-            continue
-        pid = entry.get("player_id")
-        if pid is None:
-            continue
-        try:
-            pid_int = int(pid)
-        except (TypeError, ValueError):
-            continue
-        if pid_int in used_ids:
-            continue
-        r = entry.get("real_role")
-        if r in {"Doctor", "Sheriff", "Investigator", "Lookout", "Tracker", "Escort", "Transporter", "Bodyguard", "Vigilante"}:
-            usable.append(entry)
-
-    if corpse_number < 1 or corpse_number > len(usable):
-        return await ctx.send("Invalid corpse number. Use `!corpses` first.")
-    corpse = usable[corpse_number - 1]
-    corpse_role = corpse["real_role"]
-
-    t1 = await game.get_target_from_input(ctx, target1_num, allow_self=True)
-    if not t1:
-        return
-    if corpse_role == "Doctor":
-        if game.role_states.get(t1.id, {}).get("is_revealed") and game.player_roles.get(t1.id) == "Mayor":
-            return await ctx.send("Cannot heal a revealed Mayor!")
-    t2 = None
-    if corpse_role == "Transporter":
-        if target2_num is None:
-            return await ctx.send("Transporter corpse requires two targets: `!reanimate <corpse> <t1> <t2>`.")
-        t2 = await game.get_target_from_input(ctx, target2_num, allow_self=True)
-        if not t2:
-            return
-        if t1.id == t2.id:
-            return await ctx.send("You must choose two different people.")
-
-    action: Dict = {"type": "reanimate", "actor": ctx.author.id, "corpse_player_id": corpse["player_id"], "corpse_role": corpse_role, "target": t1.id}
-    if t2 is not None:
-        action["targets"] = [t1.id, t2.id]
-    await game.set_night_action(ctx, action)
-    await ctx.send("You begin your ritual over the graveyard...")
+    await _submit_action_command(ctx, "reanimate", (target1_num, target2_num) if target2_num is not None else (target1_num,), corpse_number=corpse_number)
 
 
 @bot.command()
 @commands.cooldown(1, 2, commands.BucketType.user)
 @only_during_night_gameplay()
 async def chaos(ctx: commands.Context, target1_num: int, target2_num: int) -> None:
-    game = ctx.game
-    if game.player_roles.get(ctx.author.id) != "Chaos":
-        return
-    state = game.role_states.get(ctx.author.id, {})
-    if state.get("uses_remaining", 0) <= 0:
-        return await ctx.send("You have no uses remaining.")
-    t1 = await game.get_target_from_input(ctx, target1_num, allow_self=True)
-    t2 = await game.get_target_from_input(ctx, target2_num, allow_self=True)
-    if not t1 or not t2:
-        return
-    if t1.id == t2.id:
-        return await ctx.send("You must choose two different people.")
-    await game.set_night_action(ctx, {"type": "chaos", "actor": ctx.author.id, "targets": [t1.id, t2.id]})
-    await ctx.send("Reality bends around your choices...")
+    await _submit_action_command(ctx, "chaos", (target1_num, target2_num))
 
 @bot.command()
 @commands.cooldown(1, 2, commands.BucketType.user)
 @only_during_night_gameplay()
 async def hypnotize(ctx: commands.Context, target_number: int, message_type: str) -> None:
-    game = ctx.game
-    if game.player_roles.get(ctx.author.id) != "Hypnotist":
-        return
-
-    target = await game.get_target_from_input(ctx, target_number)
-    if not target:
-        return
-
-    message_type = message_type.lower()
-    valid_types = ["healed", "roleblocked", "transported", "controlled", "attacked"]
-    if message_type not in valid_types:
-        return await ctx.send(f"❌ Invalid message type. Use: {', '.join(valid_types)}")
-
-    await game.set_night_action(ctx, {"type": "hypnotize", "target": target.id, "msg_type": message_type, "actor": ctx.author.id})
-    await ctx.send(f"Sending fake '{message_type}' message to **{target.display_name}**.")
+    await _submit_action_command(ctx, "hypnotize", (target_number,), message_type=message_type)
 
 @bot.command()
 @commands.cooldown(1, 2, commands.BucketType.user)
 @only_during_night_gameplay()
 async def tailor(ctx: commands.Context, target_number: int, *, fake_role: str) -> None:
-    game = ctx.game
-    if game.player_roles.get(ctx.author.id) != "Tailor":
-        return
-    if game.role_states.get(ctx.author.id, {}).get("uses_remaining", 0) <= 0:
-        return await ctx.send("You have no uses remaining!")
-
-    target = await game.get_target_from_input(ctx, target_number)
-    if not target:
-        return
-
-    fake_role = discord.utils.escape_mentions(discord.utils.escape_markdown(fake_role[:20]))
-    await game.set_night_action(ctx, {"type": "tailor", "target": target.id, "fake_role": fake_role, "actor": ctx.author.id})
-    await ctx.send(f"Altering **{target.display_name}**'s role to '{fake_role}'.")
+    await _submit_action_command(ctx, "tailor", (target_number,), fake_role=fake_role)
 
 @bot.command()
 @commands.cooldown(1, 2, commands.BucketType.user)
 @only_during_night_gameplay()
 async def plunder(ctx: commands.Context, target_number: int) -> None:
-    game = ctx.game
-    if game.player_roles.get(ctx.author.id) != "Pirate":
-        return
-    target = await game.get_target_from_input(ctx, target_number)
-    if not target:
-        return
-
-    duel_token = random.randint(1, 2_000_000_000)
-    await game.set_night_action(ctx, {"type": "plunder", "target": target.id, "actor": ctx.author.id, "duel_won": False, "duel_finished": False, "duel_token": duel_token})
-    CHOICES = {"🪨": "rock", "📄": "paper", "✂️": "scissors"}
-
-    async def finish_duel_if_current() -> None:
-        act = game.night_actions.get(ctx.author.id)
-        if act and act.get("type") == "plunder" and act.get("duel_token") == duel_token:
-            act["duel_won"] = False
-            act["duel_finished"] = True
-            if game.in_progress and not getattr(game, "ending", False):
-                await game.persist_flush()
-
-    async def get_choice(player: discord.Member, prompt: str, is_target: bool = False) -> str:
-        try:
-            msg = await player.send(prompt)
-            for emoji in CHOICES:
-                await msg.add_reaction(emoji)
-            check = lambda r, u: u.id == player.id and str(r.emoji) in CHOICES and r.message.id == msg.id
-            reaction, _ = await bot.wait_for("reaction_add", timeout=DUEL_DURATION, check=check)
-            return CHOICES[str(reaction.emoji)]
-        except (asyncio.TimeoutError, discord.Forbidden):
-            return "TIMEOUT_TARGET" if is_target else "TIMEOUT_PIRATE"
-
-    try:
-        results = await asyncio.gather(
-            get_choice(ctx.author, "⚔️ Choose your weapon for the plunder! (30s)"),
-            get_choice(target, "⚔️ You are being plundered! Choose your weapon. (30s)", is_target=True),
-            return_exceptions=True
-        )
-    finally:
-        # If the coroutine is cancelled/crashes mid-duel, ensure the night can still resolve.
-        await finish_duel_if_current()
-
-    if not game.in_progress:
-        await finish_duel_if_current()
-        return
-
-    game_chan = bot.get_channel(game.game_channel_id)
-    if not game_chan:
-        await finish_duel_if_current()
-        return
-
-    await game.sync_living_players(game_chan.guild)
-    living_ids = await game.get_living_ids(game_chan.guild)
-    if target.id not in living_ids:
-        await finish_duel_if_current()
-        return await ctx.send("The duel was cancelled — your target died or left during the night.")
-
-    pirate_choice = results[0] if not isinstance(results[0], Exception) else "TIMEOUT_PIRATE"
-    target_choice = results[1] if not isinstance(results[1], Exception) else "TIMEOUT_TARGET"
-
-    # Timeout handling: symmetric randomness (avoid double-timeout bias).
-    if pirate_choice == "TIMEOUT_PIRATE":
-        pirate_choice = random.choice(list(CHOICES.values()))
-    if target_choice == "TIMEOUT_TARGET":
-        target_choice = random.choice(list(CHOICES.values()))
-
-    winner = None
-    if (pirate_choice, target_choice) in [("rock", "scissors"), ("scissors", "paper"), ("paper", "rock")]:
-        winner = ctx.author
-    elif pirate_choice != target_choice:
-        winner = target
-
-    result_msg = f"Pirate chose **{pirate_choice}**, Target chose **{target_choice}**. "
-    if winner == ctx.author:
-        result_msg += "The Pirate wins the duel! 🏴‍☠️"
-        act = game.night_actions.get(ctx.author.id)
-        if act and act.get("type") == "plunder" and act.get("duel_token") == duel_token:
-            act["duel_won"] = True
-            if game.in_progress and not getattr(game, "ending", False):
-                await game.persist_flush()
-    elif winner == target:
-        result_msg += "The Target wins the duel!"
-    else:
-        result_msg += "It's a draw!"
-
-    act = game.night_actions.get(ctx.author.id)
-    if act and act.get("type") == "plunder" and act.get("duel_token") == duel_token:
-        act["duel_finished"] = True
-        if game.in_progress and not getattr(game, "ending", False):
-            await game.persist_flush()
-
-    for p in [ctx.author, target]:
-        try:
-            await p.send(result_msg)
-        except discord.Forbidden:
-            pass
+    await _submit_action_command(ctx, "plunder", (target_number,))
 
 @bot.command()
 @commands.cooldown(1, 2, commands.BucketType.user)
 @only_during_night_gameplay()
 async def guard(ctx: commands.Context, target_number: int) -> None:
-    game = ctx.game
-    if game.player_roles.get(ctx.author.id) != "Gatekeeper":
-        return
-    if game.role_states.get(ctx.author.id, {}).get("uses_remaining", 0) <= 0:
-        return await ctx.send("You have no guard uses remaining!")
-    target = await game.get_target_from_input(ctx, target_number)
-    if not target:
-        return
-    await game.set_night_action(ctx, {"type": "guard", "target": target.id, "actor": ctx.author.id})
-    await ctx.send(f"Guarding **{target.display_name}**'s location tonight.")
+    await _submit_action_command(ctx, "guard", (target_number,))
 
 @bot.command()
 @commands.cooldown(1, 2, commands.BucketType.user)
 @only_during_night_gameplay()
 async def vest(ctx: commands.Context) -> None:
-    game = ctx.game
-    if game.player_roles.get(ctx.author.id) != "Survivor":
-        return
-    if game.role_states.get(ctx.author.id, {}).get("vests_remaining", 0) <= 0:
-        return await ctx.send("You have no vests remaining!")
-    await game.set_night_action(ctx, {"type": "vest", "target": ctx.author.id, "actor": ctx.author.id})
-    await ctx.send("Using a protective vest tonight. 🦺")
+    await _submit_action_command(ctx, "vest")
 
 @bot.command()
 @commands.cooldown(1, 2, commands.BucketType.user)
 @only_during_night_gameplay()
 async def alert(ctx: commands.Context) -> None:
-    game = ctx.game
-    if game.player_roles.get(ctx.author.id) != "Scary Grandma":
-        return
-    if game.role_states.get(ctx.author.id, {}).get("alerts_remaining", 0) <= 0:
-        return await ctx.send("You have no alerts remaining!")
-    await game.set_night_action(ctx, {"type": "alert", "actor": ctx.author.id})
-    await ctx.send("You are on alert tonight. Any visitors will be shot. 🔫")
+    await _submit_action_command(ctx, "alert")
 
 @bot.command()
 @commands.cooldown(1, 2, commands.BucketType.user)
 @only_during_night_gameplay()
 async def ignite(ctx: commands.Context) -> None:
-    game = ctx.game
-    if game.player_roles.get(ctx.author.id) != "Arsonist":
-        return
-    await game.set_night_action(ctx, {"type": "ignite", "actor": ctx.author.id})
-    await ctx.send("Igniting all doused players tonight. 🔥")
+    await _submit_action_command(ctx, "ignite")
 
 
 @bot.command()
 @commands.cooldown(1, 2, commands.BucketType.user)
 @only_during_night_gameplay()
 async def clean(ctx: commands.Context) -> None:
-    game = ctx.game
-    if game.player_roles.get(ctx.author.id) != "Arsonist":
-        return
-    await game.set_night_action(ctx, {"type": "clean", "actor": ctx.author.id})
-    await ctx.send("Cleaning gasoline off yourself tonight. 🧼")
+    await _submit_action_command(ctx, "clean")
 
 # ==========================================
 # RUN BOT
 # ==========================================
+
+@bot.hybrid_command()
+@commands.cooldown(1, 2, commands.BucketType.user)
+@only_during_night_gameplay()
+async def stab(ctx: commands.Context, target_number: int) -> None:
+    return await _submit_action_command(ctx, 'sk_kill', (target_number,))
+
+@bot.hybrid_command()
+@commands.cooldown(1, 2, commands.BucketType.user)
+async def ward(ctx: commands.Context, target_number: int) -> None:
+    ctx.game = get_game_by_player_id(ctx.author.id)
+    if ctx.game is None:
+        return await ctx.send('No active game found.')
+    if ctx.guild is not None:
+        return await ctx.send('Use /actions or DM me to ward your bound player.')
+    return await _submit_action_command(ctx, 'ward', (target_number,))
+
+@bot.hybrid_command()
+@commands.cooldown(1, 2, commands.BucketType.user)
+@only_during_night_gameplay()
+async def gaze(ctx: commands.Context, target_number: int, second_target: int) -> None:
+    return await _submit_action_command(ctx, 'gaze', (target_number, second_target))
+
+@bot.hybrid_command()
+@commands.cooldown(1, 2, commands.BucketType.user)
+@only_during_night_gameplay()
+async def cautious(ctx: commands.Context) -> None:
+    return await _submit_action_command(ctx, 'cautious', ())
+
 async def _connect_forever() -> None:
     """B1: supervised gateway session with backoff on fatal disconnect."""
     _reset_gateway_watchdog_session()
@@ -2792,13 +2281,34 @@ def _require_discord_token() -> None:
     )
 
 
-_require_discord_token()
+
+def _release_single_instance_lock():
+    global _single_instance_lock_handle
+    if _single_instance_lock_handle is not None:
+        _single_instance_lock_handle.close()
+        _single_instance_lock_handle = None
 
 
-if __name__ == "__main__":
+async def _run_session():
+    try:
+        await _connect_forever()
+    finally:
+        if not bot.is_closed():
+            await bot.close()
+
+
+def main():
+    _require_discord_token()
     validate_live_settings()
     _acquire_single_instance_lock()
     try:
-        asyncio.run(_connect_forever())
+        asyncio.run(_run_session())
     except KeyboardInterrupt:
         logging.info("Interrupted.")
+    finally:
+        _release_single_instance_lock()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -45,7 +45,7 @@ def _msgs(m: _FakeMember) -> str:
     return "\n".join(m.messages).lower()
 
 
-def test_witch_control_blocked_when_gatekeeper_guard_is_effective_via_chain() -> None:
+def test_witch_control_blocked_when_chaos_guard_is_effective_via_chain() -> None:
     """
     Setup:
       - W (Witch)         attempts to control Sheriff to investigate Doctor (innocent).
@@ -86,7 +86,7 @@ def test_witch_control_blocked_when_gatekeeper_guard_is_effective_via_chain() ->
     g.player_roles = {
         1: "Witch",
         2: "Gatekeeper",
-        3: "Gatekeeper",
+        3: "Chaos",
         4: "Escort",
         5: "Sheriff",
         6: "Mobster",
@@ -105,7 +105,7 @@ def test_witch_control_blocked_when_gatekeeper_guard_is_effective_via_chain() ->
     g.night_actions = {
         1: {"type": "control", "actor": 1, "targets": [5, 7]},  # W: force S → investigate Doctor
         2: {"type": "guard", "actor": 2, "target": 5},          # GK1 guards Sheriff
-        3: {"type": "guard", "actor": 3, "target": 2},          # GK2 guards GK1
+        3: {"type": "guard", "actor": 3, "target": 2, "_from_chaos": True},          # GK2 guards GK1
         4: {"type": "roleblock", "actor": 4, "target": 2},      # E roleblocks GK1 (but is gk-blocked)
         5: {"type": "investigate", "actor": 5, "target": 6, "role": "Sheriff"},  # S → Mobster
     }
@@ -292,8 +292,8 @@ def test_chaos_dms_both_targets_without_revealing_effect() -> None:
 
     a_msgs = _msgs(a)
     b_msgs = _msgs(b)
-    assert "touch of chaos" in a_msgs, f"target1 missing Chaos DM: {a_msgs}"
-    assert "touch of chaos" in b_msgs, f"target2 missing Chaos DM: {b_msgs}"
+    assert "chaos take hold" in a_msgs, f"target1 missing Chaos DM: {a_msgs}"
+    assert "chaos take hold" in b_msgs, f"target2 missing Chaos DM: {b_msgs}"
 
     # The DM must not reveal the effect (no effect names like 'roleblock', 'frame', etc.)
     for forbidden in ["roleblock", "frame", "transport", "investigate", "watch", "track", "hide", "guard"]:

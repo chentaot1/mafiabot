@@ -39,4 +39,4 @@ def test_import_bot_has_supervisor_entrypoint() -> None:
     root = Path(__file__).resolve().parents[1]
     src = (root / "bot.py").read_text(encoding="utf-8")
     assert "async def _connect_forever" in src
-    assert "asyncio.run(_connect_forever())" in src
+    assert "asyncio.run(_run_session())" in src

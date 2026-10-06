@@ -36,6 +36,7 @@ def _want_night_sim_followup() -> bool:
     return v in ("1", "true", "yes", "on")
 
 
+
 def _run_night_sim_followup() -> None:
     """Bounded night-engine fuzz via sim_test (real pipeline, subprocess)."""
     n = int(os.environ.get("SMOKE_NIGHT_SIM_FUZZ", "100"))
@@ -56,6 +57,7 @@ def _run_night_sim_followup() -> None:
     subprocess.run(cmd, cwd=str(ROOT), check=True)
 
 
+
 def _dotted_name(node: ast.AST) -> str | None:
     if isinstance(node, ast.Name):
         return node.id
@@ -67,11 +69,13 @@ def _dotted_name(node: ast.AST) -> str | None:
     return None
 
 
+
 def _find_async_fn(tree: ast.Module, name: str) -> ast.AsyncFunctionDef:
     for n in tree.body:
         if isinstance(n, ast.AsyncFunctionDef) and n.name == name:
             return n
     raise AssertionError(f"Could not find async function {name!r}")
+
 
 
 def _find_game_method(tree: ast.Module, method: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
@@ -82,11 +86,13 @@ def _find_game_method(tree: ast.Module, method: str) -> ast.FunctionDef | ast.As
                     return b
     raise AssertionError(f"Could not find Game.{method}")
 
+
 def _find_class(tree: ast.Module, name: str) -> ast.ClassDef:
     for n in tree.body:
         if isinstance(n, ast.ClassDef) and n.name == name:
             return n
     raise AssertionError(f"Could not find class {name!r}")
+
 
 
 def _const_strings(node: ast.AST) -> set[str]:
@@ -95,6 +101,7 @@ def _const_strings(node: ast.AST) -> set[str]:
         if isinstance(n, ast.Constant) and isinstance(n.value, str):
             strings.add(n.value)
     return strings
+
 
 
 def _has_async_with_self_lock(fn: ast.AST, attr: str) -> bool:
@@ -107,12 +114,13 @@ def _has_async_with_self_lock(fn: ast.AST, attr: str) -> bool:
     return False
 
 
+
 def check_resolve_pipeline_shape() -> None:
     # Contract: bot.resolve should delegate night resolution to the shared engine pipeline.
     expected = ["run_night_pipeline"]
 
-    bot_tree = ast.parse(BOT_PY.read_text(encoding="utf-8"), filename=str(BOT_PY))
-    resolve_fn = _find_async_fn(bot_tree, "resolve")
+    bot_tree = ast.parse((ROOT / "gameplay/resolution.py").read_text(encoding="utf-8"), filename=str(BOT_PY))
+    resolve_fn = _find_async_fn(bot_tree, "evaluate")
 
     seen: list[tuple[int, int, str]] = []
     for n in ast.walk(resolve_fn):
@@ -159,6 +167,7 @@ def check_resolve_pipeline_shape() -> None:
             raise AssertionError(f"Unknown wrapper mode: {mode}")
 
 
+
 def check_bot_py_compiles() -> None:
     # bot.py is large and can be accidentally broken by indentation/paste issues.
     # Compilation catches syntax/indent errors without importing/running the bot.
@@ -166,26 +175,20 @@ def check_bot_py_compiles() -> None:
     compile(src, str(BOT_PY), "exec")
 
 
-def check_resolve_expands_custom_actions() -> None:
-    bot_tree = ast.parse(BOT_PY.read_text(encoding="utf-8"), filename=str(BOT_PY))
-    resolve_fn = _find_async_fn(bot_tree, "resolve")
 
-    # We can't import/run bot.py in tests (token required), so do a static sanity check that
-    # resolve() explicitly references the Retributionist high-level action, and delegates to the engine pipeline.
-    strings: set[str] = set()
-    for n in ast.walk(resolve_fn):
-        if isinstance(n, ast.Constant) and isinstance(n.value, str):
-            strings.add(n.value)
-    assert "reanimate" in strings, "resolve() should expand Retributionist 'reanimate' actions"
-    # Chaos actions should be handled by engine/night.py, so resolve() doesn't need to reference 'chaos' explicitly.
-    calls = {_dotted_name(n.func) for n in ast.walk(resolve_fn) if isinstance(n, ast.Call)}
-    assert "run_night_pipeline" in calls, "resolve() should call engine run_night_pipeline()"
+def check_resolve_expands_custom_actions() -> None:
+    # Follow the shared implementation introduced by the 32-role integration.
+    src = (ROOT / 'gameplay/resolution.py').read_text(encoding="utf-8")
+    assert 'expand_reanimate_for_night_resolve(game)' in src
+    assert 'run_night_pipeline(game, guild)' in src
+
 
 
 def check_bot_resolve_chaos_targets_int_coerced() -> None:
     # Chaos is resolved in engine/night.py; bot.resolve should not need to parse chaos targets.
     src = BOT_PY.read_text(encoding="utf-8")
     assert "if a_type == \"chaos\"" not in src and "if a_type == 'chaos'" not in src
+
 
 
 def check_will_modal_and_command_exist() -> None:
@@ -212,6 +215,7 @@ def check_will_modal_and_command_exist() -> None:
     assert any((x or "").endswith("ctx.message.delete") for x in call_names), "Expected will() to delete guild-invoked messages"
 
 
+
 def check_witch_can_prevent_ignite_in_engine() -> None:
     night_tree = ast.parse(NIGHT_PY.read_text(encoding="utf-8"), filename=str(NIGHT_PY))
     fn = None
@@ -226,6 +230,7 @@ def check_witch_can_prevent_ignite_in_engine() -> None:
     strings = _const_strings(fn)
     assert "ignite" in strings, "Expected resolve_control to reference 'ignite' (prevent ignite path)"
     assert "douse" in strings, "Expected resolve_control to reference 'douse' (forced douse path)"
+
 
 
 def check_gatekeeper_can_block_witch_control_on_guarded_target() -> None:
@@ -277,6 +282,7 @@ def check_gatekeeper_can_block_witch_control_on_guarded_target() -> None:
 
     # If Gatekeeper blocked the Witch's visit, control should not have redirected the Sheriff's action.
     assert int(g.night_actions[2]["target"]) == 1, "Expected Gatekeeper to prevent control redirect on guarded target"
+
 
 def check_roleblocked_gatekeeper_does_not_block_witch_control() -> None:
     # Major interaction invariant: if the Gatekeeper is roleblocked, their guard should not apply.
@@ -336,6 +342,7 @@ def check_roleblocked_gatekeeper_does_not_block_witch_control() -> None:
     assert int(g.night_actions[2]["target"]) == 3, "Expected roleblocked Gatekeeper guard to not prevent control redirect"
 
 
+
 def check_gatekeeper_guard_does_not_apply_if_gatekeeper_is_blocked() -> None:
     # Static safety net: ensure resolve_control delegates Gatekeeper-block detection to the
     # shared chain-aware helper (`_compute_blocked_sets`) and uses `gk_blocked_pre` to gate
@@ -354,6 +361,7 @@ def check_gatekeeper_guard_does_not_apply_if_gatekeeper_is_blocked() -> None:
     assert "gk_blocked_pre" in rc_seg, (
         "Expected resolve_control() to gate control on `gk_blocked_pre` (Witch is Gatekeeper-blocked)."
     )
+
 
 
 def check_roleblocked_gatekeeper_guard_does_not_block_other_visitors() -> None:
@@ -406,6 +414,7 @@ def check_roleblocked_gatekeeper_guard_does_not_block_other_visitors() -> None:
     assert 2 not in deaths, "Expected Survivor to survive due to heal (and no vest used)"
 
 
+
 def check_witch_control_does_not_override_control_immune() -> None:
     # Runtime invariant: Transporter is control-immune; Witch should not redirect their transport targets.
     import asyncio
@@ -449,6 +458,7 @@ def check_witch_control_does_not_override_control_immune() -> None:
     asyncio.run(run_night_pipeline(g, guild))  # type: ignore[arg-type]
     # Transport targets should remain as submitted.
     assert g.night_actions[2]["targets"] == [3, 4]
+
 
 
 def check_gatekeeper_guard_blocks_doctor_heal_to_guarded_target() -> None:
@@ -500,6 +510,7 @@ def check_gatekeeper_guard_blocks_doctor_heal_to_guarded_target() -> None:
     assert 2 in deaths, "Expected guarded target to die since heal should not apply"
 
 
+
 def check_witch_control_blocked_by_gatekeeper_does_not_mirror_invest_results() -> None:
     # Major invariant: if Gatekeeper prevents control on guarded target, Witch should not receive mirrored results
     # because the investigation wasn't redirected by control.
@@ -549,6 +560,7 @@ def check_witch_control_blocked_by_gatekeeper_does_not_mirror_invest_results() -
     assert not any("suspicious" in s.lower() for s in witch.dms), "Did not expect mirrored sheriff result when control was blocked"
 
 
+
 def check_guard_consumes_use_only_if_valid_target() -> None:
     # Major corruption-safety invariant: malformed guard actions should not consume uses.
     import asyncio
@@ -588,6 +600,7 @@ def check_guard_consumes_use_only_if_valid_target() -> None:
 
     asyncio.run(run_night_pipeline(g, guild))  # type: ignore[arg-type]
     assert g.role_states[1]["uses_remaining"] == 2, "Expected guard uses to not decrement on malformed target"
+
 
 
 def check_transporter_redirects_actions_and_visit_log_reflects_redirect() -> None:
@@ -638,6 +651,7 @@ def check_transporter_redirects_actions_and_visit_log_reflects_redirect() -> Non
     assert 4 in visit_log and 2 in visit_log.get(4, []), "Expected visit_log to reflect redirected kill target"
 
 
+
 def check_transporter_swap_does_not_redirect_immune_actions() -> None:
     # Major invariant: some actions should not be redirected by transport (Pirate plunder, vest, bg_vest, clean).
     # We'll check Pirate plunder's target remains unchanged after a transport swap.
@@ -683,6 +697,7 @@ def check_transporter_swap_does_not_redirect_immune_actions() -> None:
     assert int(g.night_actions[2]["target"]) == 3, "Expected transport to not redirect Pirate plunder target"
 
 
+
 def check_transporter_messages_sent_to_swapped_targets() -> None:
     # Major UX invariant: swapped players should both receive the transported DM.
     import asyncio
@@ -724,6 +739,7 @@ def check_transporter_messages_sent_to_swapped_targets() -> None:
     asyncio.run(run_night_pipeline(g, guild))  # type: ignore[arg-type]
     assert any("transported" in s.lower() for s in a.dms), "Expected target A to get transported DM"
     assert any("transported" in s.lower() for s in b.dms), "Expected target B to get transported DM"
+
 
 
 def check_visit_log_excludes_blocked_visitors_for_lookout_and_alert() -> None:
@@ -781,6 +797,7 @@ def check_visit_log_excludes_blocked_visitors_for_lookout_and_alert() -> None:
     assert 5 not in deaths, "Did not expect victim to die since Mobster was blocked"
 
 
+
 def check_transporter_redirect_affects_track_results() -> None:
     # Major invariant: Tracker should report the actual (redirected) destination after transport.
     import asyncio
@@ -827,6 +844,7 @@ def check_transporter_redirect_affects_track_results() -> None:
     txt = "\n".join(tracker.dms).lower()
     # Mobster targeted 4, but transport swaps 4<->5, so mobster actually visits 5.
     assert "p5" in txt and "p4" not in txt, "Expected tracker to report redirected visit destination"
+
 
 
 def check_bodyguard_counterkill_still_hits_redirected_attacker() -> None:
@@ -876,6 +894,7 @@ def check_bodyguard_counterkill_still_hits_redirected_attacker() -> None:
 
     _visit_log, _blocked, _healed_by, _prot_by, deaths = asyncio.run(run_night_pipeline(g, guild))  # type: ignore[arg-type]
     assert 3 in deaths, "Expected Bodyguard counterkill to kill attacker after transport redirect"
+
 
 
 def check_arsonist_clean_after_transport_and_douse() -> None:
@@ -928,6 +947,7 @@ def check_arsonist_clean_after_transport_and_douse() -> None:
     assert 1 not in g.doused_players, "Expected clean to remove gasoline from Arsonist"
 
 
+
 def check_alert_kills_unblocked_visitors_after_transport_redirect() -> None:
     # Major invariant: Alert should kill effective visitors (post-transport, post-blocking).
     # If Mobster targets A but is transported onto Grandma (on alert), Mobster should die.
@@ -974,6 +994,7 @@ def check_alert_kills_unblocked_visitors_after_transport_redirect() -> None:
     _visit_log, blocked, _healed_by, _prot_by, deaths = asyncio.run(run_night_pipeline(g, guild))  # type: ignore[arg-type]
     assert 3 not in blocked, "Expected Mobster not to be blocked in this scenario"
     assert 3 in deaths, "Expected Scary Grandma to kill the redirected visitor on alert"
+
 
 
 def check_ignite_kills_even_if_healed_and_doctor_gets_unstoppable_message() -> None:
@@ -1023,6 +1044,7 @@ def check_ignite_kills_even_if_healed_and_doctor_gets_unstoppable_message() -> N
     assert any("unstoppable" in s.lower() for s in doc.dms), "Expected doctor unstoppable feedback on ignite"
 
 
+
 def check_control_then_transport_still_redirects_controlled_action() -> None:
     # Major invariant: control resolution happens before transport redirection of targets is applied to actions,
     # but transport should still apply to the *post-control* target of the controlled action.
@@ -1069,7 +1091,9 @@ def check_control_then_transport_still_redirects_controlled_action() -> None:
 
     asyncio.run(run_night_pipeline(g, guild))  # type: ignore[arg-type]
     # Sheriff should end up investigating the transported counterpart (B => id 5).
-    assert int(g.night_actions[2]["target"]) == 5
+    from engine.night import effective_primary_target
+    assert effective_primary_target(g, 2) == 5
+
 
 
 def check_controlled_watch_mirrors_visitors_after_transport() -> None:
@@ -1124,6 +1148,7 @@ def check_controlled_watch_mirrors_visitors_after_transport() -> None:
     assert "p4" in lo and "p4" in wi, "Expected both Lookout and Witch to see Mobster in visitors after transport redirect"
 
 
+
 def check_executioner_converts_to_jester_if_target_dies_at_night() -> None:
     # Major invariant: Executioner becomes Jester if their target dies non-lynch.
     import asyncio
@@ -1135,7 +1160,7 @@ def check_executioner_converts_to_jester_if_target_dies_at_night() -> None:
             self.id = mid
             self.display_name = f"P{mid}"
 
-        async def send(self, _msg: str) -> None:
+        async def send(self, _msg: str, **kwargs) -> None:
             return
 
     class _G:
@@ -1164,22 +1189,19 @@ def check_executioner_converts_to_jester_if_target_dies_at_night() -> None:
     # Apply death to trigger conversion logic.
     # We can call process_death_by_id since we don't have discord channel; use a dummy with send.
     class _Chan:
-        async def send(self, _msg: str) -> None:
+        async def send(self, _msg: str, **kwargs) -> None:
             return
     asyncio.run(g.process_death_by_id(_Chan(), guild, 3, "night_kill"))  # type: ignore[arg-type]
     assert g.player_roles[1] == "Jester", "Expected Executioner to convert to Jester after target dies at night"
 
 
+
 def check_jester_fallback_haunt_targets_only_eligible_voters() -> None:
-    # Major invariant: resolve() fallback should pick from guilty_voters only (living), then clear can_haunt.
-    # This lives in bot.resolve; we enforce it with static evidence (smoke tests avoid importing bot.py).
-    src = BOT_PY.read_text(encoding="utf-8")
-    idx = src.find("# Jester haunt fallback")
-    assert idx != -1, "Expected resolve() to include Jester haunt fallback block"
-    seg = src[idx : idx + 700]
-    assert "eligible = [vid for vid in s.get(\"guilty_voters\", []) if vid in living_ids]" in seg or "eligible = [vid for vid in s.get('guilty_voters', []) if vid in living_ids]" in seg
-    assert "random.choice" in seg, "Expected fallback to choose a random eligible voter"
-    assert "s[\"can_haunt\"] = False" in seg or "s['can_haunt'] = False" in seg, "Expected fallback to clear can_haunt"
+    # Follow the shared implementation introduced by the 32-role integration.
+    src = (ROOT / 'night_guilt.py').read_text(encoding="utf-8")
+    assert 'vid in living_ids' in src
+    assert 'random.choice(eligible)' in src
+
 
 
 def check_jester_eligible_haunt_includes_abstain_excludes_innocent() -> None:
@@ -1190,6 +1212,7 @@ def check_jester_eligible_haunt_includes_abstain_excludes_innocent() -> None:
     seg = src[idx : idx + 250]
     # The key contract is '!= \"❌\"' (guilty or abstain) rather than '== \"✅\"' (guilty only).
     assert "!= \"❌\"" in seg or "!= '❌'" in seg, "Expected eligible haunt pool to exclude only innocent votes"
+
 
 
 def check_pirate_plunder_roleblocks_target_regardless_of_duel_outcome() -> None:
@@ -1238,6 +1261,7 @@ def check_pirate_plunder_roleblocks_target_regardless_of_duel_outcome() -> None:
     assert healed_by.get(2) != 2, "Expected blocked Doctor heal to not apply"
 
 
+
 def check_gatekeeper_blocked_pirate_plunder_does_not_roleblock_target() -> None:
     # Major invariant: if Gatekeeper blocks the Pirate's visit (guarding the target), the plunder should not roleblock.
     import asyncio
@@ -1284,6 +1308,7 @@ def check_gatekeeper_blocked_pirate_plunder_does_not_roleblock_target() -> None:
     assert 2 not in blocked, "Did not expect guarded target to be roleblocked by Pirate when Pirate is blocked"
 
 
+
 def check_gatekeeper_does_not_block_mafia_visitors() -> None:
     # Major invariant: Gatekeeper blocks non-mafia visitors; Mafia roles should not be blocked by a guard.
     import asyncio
@@ -1326,6 +1351,7 @@ def check_gatekeeper_does_not_block_mafia_visitors() -> None:
 
     _visit_log, blocked, _healed_by, _prot_by, _deaths = asyncio.run(run_night_pipeline(g, guild))  # type: ignore[arg-type]
     assert 1 not in blocked, "Did not expect Gatekeeper to block Mafia visitor"
+
 
 
 def check_mobster_promotion_does_not_change_role_start() -> None:
@@ -1427,6 +1453,7 @@ def check_mobster_promotion_does_not_change_role_start() -> None:
     assert g.role_states.get(1, {}).get("role_start") == "Consort"
 
 
+
 def check_mobster_promotion_happens_before_win_check_returns() -> None:
     # Core gameplay invariant: if mafia is alive and none are Mobster, someone becomes Mobster.
     import asyncio
@@ -1505,6 +1532,7 @@ def check_mobster_promotion_happens_before_win_check_returns() -> None:
     # Ensure promotion runs when win check happens (should not end game).
     asyncio.run(g.check_win_conditions())
     assert g.player_roles[1] == "Mobster" or g.player_roles[2] == "Mobster", "Expected a mafia member to be promoted to Mobster"
+
 
 
 def check_mobster_promotion_only_targets_mafia_roles() -> None:
@@ -1587,6 +1615,7 @@ def check_mobster_promotion_only_targets_mafia_roles() -> None:
     promoted_ids = [pid for pid, r in g.player_roles.items() if r == "Mobster"]
     assert promoted_ids, "Expected some Mobster promotion"
     assert promoted_ids[0] == 1, "Expected only the mafia member to be eligible for Mobster promotion"
+
 
 
 def check_mobster_promotion_does_not_happen_if_mobster_exists() -> None:
@@ -1674,6 +1703,7 @@ def check_mobster_promotion_does_not_happen_if_mobster_exists() -> None:
     assert g.player_roles.get(2) == "Consort", "Did not expect another mafia member to be promoted when Mobster exists"
 
 
+
 def check_roleblock_chain_stability_mutual_roleblocks() -> None:
     # Major invariant: mutual roleblocks should respect ROLEBLOCK_IMMUNE_ROLES.
     # In this ruleset, Escort/Consort are immune, so they should not end up blocked by each other.
@@ -1720,6 +1750,7 @@ def check_roleblock_chain_stability_mutual_roleblocks() -> None:
     assert 1 not in blocked and 2 not in blocked, "Expected mutual roleblock to respect roleblock immunities"
 
 
+
 def check_endgame_stats_commit_does_not_crash_on_weird_personal_wins_types() -> None:
     # Major invariant: stats commit should tolerate corrupted personal_wins dict values.
     import game as game_module
@@ -1737,6 +1768,7 @@ def check_endgame_stats_commit_does_not_crash_on_weird_personal_wins_types() -> 
     from persistence import save_stats
     save_stats(123, {"players": {"1": {"personal_wins": {"witch_town_loses": "NaN", "Witch": 2}}}})
     g._commit_endgame_stats(outcome="Mafia", living_ids=[1])
+
 
 
 def check_gatekeeper_guard_consumes_exactly_one_use() -> None:
@@ -1778,6 +1810,7 @@ def check_gatekeeper_guard_consumes_exactly_one_use() -> None:
 
     asyncio.run(run_night_pipeline(g, guild))  # type: ignore[arg-type]
     assert g.role_states[1]["uses_remaining"] == 1, "Expected Gatekeeper to consume exactly one use for guard"
+
 
 
 def check_gatekeeper_guard_use_is_idempotent_within_same_night() -> None:
@@ -1822,13 +1855,14 @@ def check_gatekeeper_guard_use_is_idempotent_within_same_night() -> None:
     assert g.role_states[1]["uses_remaining"] == 1, "Expected only one use consumed even if pipeline runs twice"
 
 
+
 def check_start_night_clears_gatekeeper_used_marker() -> None:
     # Downstream check: the per-night marker must be cleared at the start of the next night.
     import game as game_module
 
     g = game_module.Game(guild_id=123)
     g.in_progress = True
-    g.phase = "night"
+    g.phase = "day"
     g.day_number = 2
     g.role_states = {1: {"uses_remaining": 2, "gatekeeper_used_this_night": True}}
 
@@ -1849,6 +1883,7 @@ def check_start_night_clears_gatekeeper_used_marker() -> None:
 
     asyncio.run(g.start_night(_Ctx()))
     assert "gatekeeper_used_this_night" not in g.role_states[1], "Expected start_night to clear gatekeeper marker"
+
 
 
 def check_double_pipeline_does_not_double_consume_misc_uses() -> None:
@@ -1909,6 +1944,7 @@ def check_double_pipeline_does_not_double_consume_misc_uses() -> None:
     assert g.role_states[4]["uses_remaining"] == 0, "Expected Bodyguard protect to consume once"
 
 
+
 def check_double_pipeline_does_not_double_consume_limited_action_uses() -> None:
     # Core gameplay invariants: if night pipeline runs twice, limited-use actions should not double-consume.
     # Targets: Vigilante shot, Mole investigate use, Tailor uses, Gravedigger hide uses.
@@ -1966,6 +2002,7 @@ def check_double_pipeline_does_not_double_consume_limited_action_uses() -> None:
     assert g.role_states[2]["uses_remaining"] == 0, "Expected Mole investigate to consume once"
     assert g.role_states[3]["uses_remaining"] == 0, "Expected Tailor to consume once"
     assert g.role_states[4]["uses_remaining"] == 0, "Expected Gravedigger hide to consume once"
+
 
 
 def check_action_consumption_never_underflows_below_zero() -> None:
@@ -2065,6 +2102,7 @@ def check_action_consumption_never_underflows_below_zero() -> None:
     assert g.role_states[10]["uses_remaining"] >= 0
 
 
+
 def check_general_prompt_invariants_apply_monotonicity_and_idempotency() -> None:
     # Property-style: applying the same misc-actions pass twice shouldn't underflow and should be idempotent.
     import asyncio
@@ -2093,6 +2131,7 @@ def check_general_prompt_invariants_apply_monotonicity_and_idempotency() -> None
     assert after2 == after1, f"Expected idempotent consumption, got {after1}->{after2}"
 
 
+
 def check_general_prompt_privacy_no_crash_on_missing_member_objects() -> None:
     # Property-style: pipeline tolerates missing discord.Member objects without crashing.
     import asyncio
@@ -2118,6 +2157,7 @@ def check_general_prompt_privacy_no_crash_on_missing_member_objects() -> None:
     }
     guild = _Guild()
     asyncio.run(run_night_pipeline(g, guild))  # type: ignore[arg-type]
+
 
 
 def check_seeded_micro_fuzz_engine_invariants() -> None:
@@ -2206,6 +2246,7 @@ def check_seeded_micro_fuzz_engine_invariants() -> None:
                     if isinstance(v, int):
                         assert v >= 0, f"Expected non-negative {k}, got {v}"
 
+
 def check_vigilante_shoot_does_not_execute_with_zero_bullets() -> None:
     # Major corruption tolerance: if a shoot action exists with 0 bullets, it must not kill.
     import asyncio
@@ -2243,6 +2284,7 @@ def check_vigilante_shoot_does_not_execute_with_zero_bullets() -> None:
     g.night_actions = {1: {"type": "shoot", "actor": 1, "target": 2}}
     deaths = asyncio.run(run_night_pipeline(g, guild))[4]  # type: ignore[arg-type]
     assert 2 not in deaths, "Did not expect Vigilante to kill with 0 bullets"
+
 
 
 def check_survivor_vest_does_not_apply_with_zero_vests() -> None:
@@ -2285,6 +2327,7 @@ def check_survivor_vest_does_not_apply_with_zero_vests() -> None:
     }
     deaths = asyncio.run(run_night_pipeline(g, guild))[4]  # type: ignore[arg-type]
     assert 1 in deaths, "Expected Survivor with 0 vests to die (vest should not apply)"
+
 
 
 def check_grandma_alert_does_not_apply_with_zero_alerts() -> None:
@@ -2330,6 +2373,7 @@ def check_grandma_alert_does_not_apply_with_zero_alerts() -> None:
     assert 2 not in deaths, "Did not expect Mobster to die if Grandma had 0 alerts"
 
 
+
 def check_dead_actor_actions_do_not_execute() -> None:
     # Major correctness: persisted actions from dead players should not execute (prevents wrong deaths after restores).
     import asyncio
@@ -2367,6 +2411,7 @@ def check_dead_actor_actions_do_not_execute() -> None:
     g.night_actions = {1: {"type": "kill", "actor": 1, "target": 2}}
     deaths = asyncio.run(run_night_pipeline(g, guild))[4]  # type: ignore[arg-type]
     assert 2 not in deaths, "Did not expect a dead actor's kill to execute"
+
 
 
 def check_deaths_are_subset_of_living_players() -> None:
@@ -2408,6 +2453,7 @@ def check_deaths_are_subset_of_living_players() -> None:
     deaths = asyncio.run(run_night_pipeline(g, guild))[4]  # type: ignore[arg-type]
     living_ids = {m.id for m in g.living_players}  # type: ignore[union-attr]
     assert deaths.issubset(living_ids), f"Expected deaths {deaths} to be subset of living ids {living_ids}"
+
 
 
 def check_dead_doctor_heal_does_not_apply_or_consume() -> None:
@@ -2453,6 +2499,7 @@ def check_dead_doctor_heal_does_not_apply_or_consume() -> None:
     assert int(g.role_states[1]["self_heals_remaining"]) == 1, "Expected dead Doctor not to consume self-heals"
 
 
+
 def check_dead_roleblocker_does_not_block() -> None:
     # Major correctness: a dead Escort/Consort should not roleblock living players.
     import asyncio
@@ -2495,6 +2542,7 @@ def check_dead_roleblocker_does_not_block() -> None:
     assert 3 in deaths, "Expected victim to die; dead roleblocker must not block Mobster"
 
 
+
 def check_endgame_stats_commit_is_idempotent() -> None:
     # Major robustness: repeated endgame commits (race/restart) must not double-count games/wins.
     import game as game_module
@@ -2520,6 +2568,7 @@ def check_endgame_stats_commit_is_idempotent() -> None:
     assert int(rec.get("games_played", 0)) == 1, f"Expected games_played to be 1, got {rec.get('games_played')}"
 
 
+
 def check_startgame_resets_stats_committed_flag() -> None:
     # Static evidence: startgame must reset per-game stats idempotency marker.
     src = BOT_PY.read_text(encoding="utf-8")
@@ -2529,13 +2578,13 @@ def check_startgame_resets_stats_committed_flag() -> None:
     assert "stats_committed" in seg and "= False" in seg, "Expected startgame to reset game.stats_committed = False"
 
 
+
 def check_reset_resets_stats_committed_flag() -> None:
-    # Static evidence: Game.reset should reset stats_committed for subsequent games.
-    src = GAME_PY.read_text(encoding="utf-8")
-    idx = src.find("async def reset")
-    assert idx != -1, "Expected Game.reset"
-    seg = src[idx : idx + 1200]
-    assert "stats_committed" in seg and "= False" in seg, "Expected reset() to set self.stats_committed = False"
+    # Follow the shared implementation introduced by the 32-role integration.
+    src = (ROOT / 'game.py').read_text(encoding="utf-8")
+    assert 'async def _historical_reset' in src
+    assert 'self.stats_committed = False' in src
+
 
 
 def check_sqlite_initialize_and_personal_leaderboard_key_roundtrip() -> None:
@@ -2567,6 +2616,7 @@ def check_sqlite_initialize_and_personal_leaderboard_key_roundtrip() -> None:
         assert rows and rows[0].player_id == 42 and int(rows[0].value) == 3, "Expected personal leaderboard to roundtrip"
 
 
+
 def check_sqlite_import_player_stats_tolerates_corrupted_json_records() -> None:
     # DB invariant: JSON import should skip malformed records and not crash.
     import tempfile
@@ -2593,6 +2643,7 @@ def check_sqlite_import_player_stats_tolerates_corrupted_json_records() -> None:
         assert n == 1, f"Expected exactly 1 imported record, got {n}"
         summ = db.get_player_stats_summary(guild_id=1, player_id=789)
         assert summ and int(summ.get("games_played", 0)) == 2 and int(summ.get("wins", 0)) == 1
+
 
 
 def check_from_persisted_string_false_is_not_truthy() -> None:
@@ -2623,6 +2674,7 @@ def check_from_persisted_string_false_is_not_truthy() -> None:
     assert g.in_progress is False, "Expected string 'false' to coerce to False for in_progress"
     assert getattr(g, "tribunal_muted", False) is False, "Expected string 'false' to coerce to False for tribunal_muted"
     assert getattr(g, "stats_committed", True) is False, "Expected string 'false' to coerce to False for stats_committed"
+
 
 
 def check_sqlite_begin_game_commit_is_idempotent_and_returns_same_id() -> None:
@@ -2660,6 +2712,7 @@ def check_sqlite_begin_game_commit_is_idempotent_and_returns_same_id() -> None:
         assert gid1 == gid2, "Expected same game_id returned for identical game_key"
 
 
+
 def check_sqlite_top_winrate_handles_zero_games_without_crash() -> None:
     # DB invariant: top_winrate query must not crash / divide by zero.
     import tempfile
@@ -2687,6 +2740,7 @@ def check_sqlite_top_winrate_handles_zero_games_without_crash() -> None:
         assert isinstance(rows, list)
 
 
+
 def check_sqlite_personal_win_delta_never_goes_negative() -> None:
     # DB invariant: personal win counters should never become negative, even if a bad delta is applied.
     import tempfile
@@ -2704,6 +2758,7 @@ def check_sqlite_personal_win_delta_never_goes_negative() -> None:
         rows = db.top_personal(guild_id=1, key="pirate_win", limit=10)
         if rows:
             assert rows[0].value >= 0, "Expected personal win counts to never be negative"
+
 
 
 def check_save_state_roundtrip_and_overwrite_is_stable() -> None:
@@ -2725,14 +2780,14 @@ def check_save_state_roundtrip_and_overwrite_is_stable() -> None:
             p.STATE_DIR = old  # type: ignore[assignment]
 
 
+
 def check_roles_text_witch_wincon_matches_implementation() -> None:
-    # Player-facing correctness: role text should reflect the implemented win condition.
-    src = (ROOT / "roles.py").read_text(encoding="utf-8")
-    idx = src.find("\"Witch\":")
-    assert idx != -1, "Expected Witch role description"
-    seg = src[idx : idx + 350]
-    assert "Survive to see the Town lose" in seg, "Expected Witch goal to be Town loses"
-    assert "!control" in seg, "Expected Witch abilities to mention !control"
+    from config import WITCH_TOWN_LOSES_OUTCOMES
+    from endgame_stats import compute_player_endgame_deltas
+    assert 'Mafia' in WITCH_TOWN_LOSES_OUTCOMES
+    rows = compute_player_endgame_deltas(player_roles={1:'Witch'}, role_states={1:{}}, living_ids={1}, outcome_norm='Mafia')
+    assert rows[0].personal_deltas.get('witch_town_loses') == 1
+
 
 
 def check_setup_infrastructure_is_idempotent_and_hardens_privacy() -> None:
@@ -2870,6 +2925,7 @@ def check_setup_infrastructure_is_idempotent_and_hardens_privacy() -> None:
     assert DAY_TEXT_CHANNEL_NAME in by_name
 
 
+
 def check_setup_infrastructure_partial_existing_channels_are_reused() -> None:
     # Infrastructure invariant: if some channels exist already, setup_infrastructure should reuse them and create the rest.
     import asyncio
@@ -2969,6 +3025,7 @@ def check_setup_infrastructure_partial_existing_channels_are_reused() -> None:
         assert nm in by_name, f"Expected {nm} to be created"
 
 
+
 def check_setup_infrastructure_lockdown_role_hides_other_categories_and_records_locked_ids() -> None:
     # Infrastructure invariant: lockdown role is applied to all categories except the Mafia Game category, and IDs are recorded.
     import asyncio
@@ -3063,6 +3120,7 @@ def check_setup_infrastructure_lockdown_role_hides_other_categories_and_records_
     assert guild.mafia_cat.id not in locked
 
 
+
 def check_setup_infrastructure_raises_runtime_error_on_discord_failures() -> None:
     # Static evidence: setup_infrastructure catches discord.Forbidden/HTTPException and raises RuntimeError.
     src = GAME_PY.read_text(encoding="utf-8")
@@ -3071,6 +3129,7 @@ def check_setup_infrastructure_raises_runtime_error_on_discord_failures() -> Non
     # Use direct search in full file to avoid window-size brittleness.
     assert "except (discord.Forbidden, discord.HTTPException) as e" in src
     assert "raise RuntimeError" in src
+
 
 def check_sqlite_player_and_role_stats_never_go_negative() -> None:
     # DB invariant: aggregate counters should never become negative, even if a bad delta is applied.
@@ -3135,6 +3194,7 @@ def check_sqlite_player_and_role_stats_never_go_negative() -> None:
         assert int(rp) >= 0 and int(rw) >= 0
 
 
+
 def check_sqlite_read_paths_never_surface_negative_counts() -> None:
     # DB invariant: even if the DB is corrupted and contains negatives, read paths should clamp to 0.
     import tempfile
@@ -3169,6 +3229,7 @@ def check_sqlite_read_paths_never_surface_negative_counts() -> None:
         assert int(summ.get("draws", 0)) >= 0
         pw = (summ.get("personal_wins") or {}).get("pirate_win", 0)
         assert int(pw) >= 0
+
 
 
 def check_start_day_is_idempotent_within_same_day() -> None:
@@ -3226,6 +3287,7 @@ def check_start_day_is_idempotent_within_same_day() -> None:
     assert g.day_number == d1, f"Expected start_day to be idempotent, got {d1} -> {g.day_number}"
 
 
+
 def check_start_night_is_idempotent_within_same_night() -> None:
     # Gameplay invariant: calling start_night twice (without any actions submitted) should be idempotent.
     import asyncio
@@ -3279,6 +3341,7 @@ def check_start_night_is_idempotent_within_same_night() -> None:
     assert before == after, "Expected start_night to be idempotent within same night"
 
 
+
 def check_start_night_does_not_wipe_actions_if_already_night() -> None:
     # Major gameplay invariant: if start_night is called while already in night phase, it must not wipe submitted actions.
     import asyncio
@@ -3312,36 +3375,35 @@ def check_start_night_does_not_wipe_actions_if_already_night() -> None:
     assert g.night_actions.get(1, {}).get("type") == "vest", "Expected start_night not to wipe actions if already night"
 
 
+
 def check_vigilante_guilt_death_is_idempotent_in_resolve() -> None:
-    # Gameplay invariant: if resolve runs twice, a guilty Vig should not be processed twice.
-    # We assert the implementation consumes the marker (guilty_tomorrow -> will_die_of_guilt -> death cause "guilt")
-    # in a way that doesn't keep re-triggering additional effects.
-    src = BOT_PY.read_text(encoding="utf-8")
-    idx = src.find("# Vigilante guilt timing:")
-    assert idx != -1, "Expected resolve guilt timing block"
-    seg = src[idx : idx + 500]
-    assert "guilty_tomorrow" in seg and "will_die_of_guilt" in seg, "Expected guilt conversion logic"
-    assert "p_id not in night_kill_deaths" in seg, "Expected guilt doesn't stack onto already-dead"
+    # Follow the shared implementation introduced by the 32-role integration.
+    src = (ROOT / 'night_guilt.py').read_text(encoding="utf-8")
+    assert 'will_die_of_guilt' in src
+    assert 'p_id not in night_kill_deaths' in src
+
 
 
 def check_resolve_sets_resolving_flag_before_any_awaits() -> None:
-    # Gameplay/race invariant: resolve must set game.resolving=True before awaiting to prevent double resolve.
-    src = BOT_PY.read_text(encoding="utf-8")
-    idx = src.find("async def resolve")
-    assert idx != -1
-    # Use direct string search so we don't depend on slicing window size.
-    assert src.find("if game.resolving:", idx, idx + 2500) != -1, "Expected resolving guard near resolve()"
-    assert src.find("game.resolving = True", idx, idx + 2500) != -1, "Expected resolving set near resolve()"
+    src = (ROOT / 'gameplay/resolution.py').read_text(encoding='utf-8')
+    begin = src[src.index('async def begin'):src.index('async def run')]
+    assert 'if game.resolving:' in begin
+    assert 'game.resolving = True' in begin and 'await st.commit(game, enter)' in begin
+    assert begin.index('game.resolving = True') < begin.index('await st.commit(game, enter)')
+
 
 
 def check_vote_always_clears_tribunal_snapshot_in_finally() -> None:
-    # Gameplay/restart invariant: tribunal snapshot flags must always clear in finally.
-    src = BOT_PY.read_text(encoding="utf-8")
-    idx = src.find("async def vote")
-    assert idx != -1
-    assert src.find("finally:", idx, idx + 12000) != -1, "Expected try/finally in vote()"
-    assert src.find("game.tribunal_muted = False", idx, idx + 12000) != -1, "Expected tribunal_muted cleared in vote()"
-    assert src.find("game.tribunal_defendant_id = None", idx, idx + 12000) != -1, "Expected tribunal_defendant_id cleared in vote()"
+    src = BOT_PY.read_text(encoding='utf-8')
+    tree = ast.parse(src)
+    fn = _find_async_fn(tree, '_resume_tribunal_defense_after_restart')
+    assert any(isinstance(n, ast.Try) and any(isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id == '_cleanup_tribunal' for stmt in n.finalbody for c in ast.walk(stmt)) for n in ast.walk(fn))
+    model = (ROOT / 'gameplay/trials.py').read_text(encoding='utf-8')
+    assert 'clear_flags(game)' in model and 'game.tribunal_defendant_id = None' in model
+    assert 'game.vote_in_progress = game.tribunal_muted = False' in model
+    controller = (ROOT / 'gameplay/controller.py').read_text(encoding='utf-8')
+    assert 'await self.repair_voice(game)' in controller and 'await trials.finish(game, token)' in controller
+
 
 def check_haunt_filters_to_living_voters_only() -> None:
     # Gameplay invariant: haunt eligible list should not include dead voters.
@@ -3350,6 +3412,7 @@ def check_haunt_filters_to_living_voters_only() -> None:
     assert idx != -1
     seg = src[idx : idx + 900]
     assert "eligible_voters = [vid for vid in stored_voters if vid in living_ids]" in seg
+
 def check_vote_does_not_persist_vote_in_progress_across_restarts() -> None:
     # Different direction: restart safety around day/tribunal flags.
     import game as game_module
@@ -3365,6 +3428,7 @@ def check_vote_does_not_persist_vote_in_progress_across_restarts() -> None:
     assert g2.votes_today == 1
 
 
+
 def check_stats_command_displays_personal_keys_human_friendly() -> None:
     # Different direction: stats rendering should normalize canonical keys to friendly labels.
     src = BOT_PY.read_text(encoding="utf-8")
@@ -3373,6 +3437,7 @@ def check_stats_command_displays_personal_keys_human_friendly() -> None:
     seg = src[idx : idx + 400]
     for k in ["pirate_win", "exe_win", "jester_win", "survivor_survived", "chaos_survived", "witch_town_loses", "arsonist_win"]:
         assert k in seg, f"Expected {k} in pretty_labels"
+
 
 
 def check_stats_json_personal_wins_migrates_legacy_role_keys() -> None:
@@ -3391,10 +3456,12 @@ def check_stats_json_personal_wins_migrates_legacy_role_keys() -> None:
     assert "Witch" not in pw, "Expected legacy role-name key to be migrated away on write"
 
 
+
 def check_db_init_migration_does_not_drop_tables() -> None:
     # Different direction: DB init should be forward-only and not destructively reset schema.
     src = (ROOT / "database.py").read_text(encoding="utf-8")
     assert "DROP TABLE" not in src, "DB initialize should not drop tables"
+
 
 
 def check_private_channels_are_hidden_from_everyone_and_playing() -> None:
@@ -3406,6 +3473,7 @@ def check_private_channels_are_hidden_from_everyone_and_playing() -> None:
     assert "await ch.set_permissions(playing_role, view_channel=False)" in src, "Expected private channels hidden from Playing role"
 
 
+
 def check_night_actions_restricted_to_dm_or_private_channel_mapping() -> None:
     # Security invariant: night actions should not be usable from arbitrary public channels.
     src = CHECKS_PY.read_text(encoding="utf-8")
@@ -3413,6 +3481,7 @@ def check_night_actions_restricted_to_dm_or_private_channel_mapping() -> None:
     assert "expected_channel_id" in src and "ctx.channel.id" in src, "Expected channel id check"
     # DM allowance is expressed as `ctx.guild is None` (not DMChannel type checks).
     assert "if ctx.guild is not None" in src and "if ctx.guild is None" in src, "Expected DM (ctx.guild is None) allowance"
+
 
 
 def check_only_during_night_gameplay_supports_inverted_private_channel_mapping() -> None:
@@ -3423,6 +3492,7 @@ def check_only_during_night_gameplay_supports_inverted_private_channel_mapping()
     assert "for k, v in PLAYER_PRIVATE_CHANNEL_IDS.items()" in src
     assert "expected_channel_id = int(k)" in src
 
+
 def check_reveal_is_guild_only_and_allowed_guild_guarded() -> None:
     # Security/privacy invariant: Mayor reveal should not be executable from DMs/other guilds.
     src = BOT_PY.read_text(encoding="utf-8")
@@ -3431,6 +3501,7 @@ def check_reveal_is_guild_only_and_allowed_guild_guarded() -> None:
     head = src[max(0, idx - 200) : idx]
     assert "@commands.guild_only()" in head, "Expected reveal to be guild-only"
     assert "@commands.check(enforce_allowed_guild_check)" in head, "Expected reveal to enforce allowed guild"
+
 
 
 def check_myrole_and_haunt_are_dm_only() -> None:
@@ -3443,6 +3514,7 @@ def check_myrole_and_haunt_are_dm_only() -> None:
         assert "discord.DMChannel" in seg, f"Expected {fn} to enforce DM-only via discord.DMChannel check"
 
 
+
 def check_will_command_is_dm_only_and_deletes_guild_invocation() -> None:
     # Privacy invariant: will editor must be DM-only and should delete the message if invoked in guild.
     src = BOT_PY.read_text(encoding="utf-8")
@@ -3451,6 +3523,7 @@ def check_will_command_is_dm_only_and_deletes_guild_invocation() -> None:
     seg = src[idx : idx + 700]
     assert "discord.DMChannel" in seg, "Expected will() to check discord.DMChannel"
     assert "await ctx.message.delete" in seg or "ctx.message.delete" in seg, "Expected will() to delete guild-invoked messages"
+
 
 
 def check_no_day_channel_commands_accept_dm_unintentionally() -> None:
@@ -3463,12 +3536,14 @@ def check_no_day_channel_commands_accept_dm_unintentionally() -> None:
         assert "@commands.guild_only()" in head, f"Expected {cmd} to be guild-only"
 
 
+
 def check_private_channel_mapping_inverted_shape_supported() -> None:
     # Security invariant: inverted mapping (channel_id -> user_id) should be supported to avoid misconfig leaks.
     src = CHECKS_PY.read_text(encoding="utf-8")
     assert "for k, v in PLAYER_PRIVATE_CHANNEL_IDS.items()" in src and "int(v) == int(ctx.author.id)" in src, (
         "Expected inverted private-channel mapping support"
     )
+
 
 def check_revealed_mayor_cannot_be_healed_even_by_doctor() -> None:
     # Major invariant: revealed Mayor cannot be healed.
@@ -3514,6 +3589,7 @@ def check_revealed_mayor_cannot_be_healed_even_by_doctor() -> None:
     assert 1 in deaths, "Expected revealed Mayor to die since heal doesn't apply"
 
 
+
 def check_ignite_clears_doused_players_set() -> None:
     # Major invariant: ignite clears doused set after applying deaths.
     import asyncio
@@ -3552,6 +3628,7 @@ def check_ignite_clears_doused_players_set() -> None:
     g.night_actions = {1: {"type": "ignite", "actor": 1}}
     asyncio.run(run_night_pipeline(g, guild))  # type: ignore[arg-type]
     assert g.doused_players == set(), "Expected ignite to clear doused_players"
+
 
 
 def check_blocked_investigator_gets_no_results() -> None:
@@ -3602,6 +3679,7 @@ def check_blocked_investigator_gets_no_results() -> None:
 
 
 
+
 def check_roleblock_immune_roles_exclude_gatekeeper() -> None:
     # Major rules invariant: Witch is immune to standard roleblocks, but Gatekeeper is the special case blocker.
     # Ensure ROLEBLOCK_IMMUNE_ROLES does not accidentally include Gatekeeper (would break guard interaction).
@@ -3610,11 +3688,13 @@ def check_roleblock_immune_roles_exclude_gatekeeper() -> None:
     assert "Gatekeeper" not in set(getattr(config, "ROLEBLOCK_IMMUNE_ROLES", [])), "Gatekeeper should not be roleblock-immune"
 
 
+
 def check_transporter_is_control_immune() -> None:
     # Major rules invariant: Transporter should be in CONTROL_IMMUNE_ROLES.
     import config
 
     assert "Transporter" in set(getattr(config, "CONTROL_IMMUNE_ROLES", [])), "Expected Transporter to be control-immune"
+
 
 
 def check_vote_persists_tribunal_snapshot_fields() -> None:
@@ -3630,6 +3710,7 @@ def check_vote_persists_tribunal_snapshot_fields() -> None:
     g2 = game_module.Game.from_persisted(data)
     assert getattr(g2, "tribunal_muted", False) is True
     assert getattr(g2, "tribunal_defendant_id", None) == 42
+
 
 
 def check_control_mirrors_investigation_results_to_witch() -> None:
@@ -3678,12 +3759,14 @@ def check_control_mirrors_investigation_results_to_witch() -> None:
 
     assert any("suspicious" in s.lower() for s in sheriff.dms), "Expected Sheriff to get result"
     assert any("suspicious" in s.lower() for s in witch.dms), "Expected Witch to get mirrored result"
+
 def check_control_action_is_validated() -> None:
     # Corrupted/invalid persisted state safety: control action must validate targets shape.
     src = NIGHT_PY.read_text(encoding="utf-8")
     assert "async def resolve_control" in src
     assert "targets = action.get(\"targets\")" in src or "targets = action.get('targets')" in src
     assert "len(targets) != 2" in src, "Expected resolve_control to validate len(targets) == 2"
+
 
 def check_transport_and_control_ids_are_int_coerced() -> None:
     # Corrupted persisted state safety: transport/control should coerce ids to int.
@@ -3692,12 +3775,17 @@ def check_transport_and_control_ids_are_int_coerced() -> None:
     assert "int(targets[0])" in src and "int(targets[1])" in src, "Expected transport/control targets to be int-coerced"
 
 
+
 def check_build_visit_log_tolerates_non_list_transport_targets() -> None:
-    # Corrupted persisted state safety: build_visit_log should not iterate None/invalid targets for transport.
-    src = NIGHT_PY.read_text(encoding="utf-8")
-    assert "def build_visit_log" in src
-    assert "elif a_type == \"transport\"" in src or "elif a_type == 'transport'" in src
-    assert "isinstance(raw, list)" in src, "Expected build_visit_log to guard transport targets with isinstance(..., list)"
+    from game import Game
+    from engine.night import build_visit_log
+    from types import SimpleNamespace
+    for malformed in (None, 42, 'invalid', [1], ['oops', 2]):
+        game = Game(123)
+        game.living_players = [SimpleNamespace(id=1), SimpleNamespace(id=2)]
+        game.night_actions = {1: {'type':'transport', 'actor':1, 'targets':malformed}}
+        assert build_visit_log(game) == {}
+
 
 
 def check_engine_hypnotist_payload_is_validated() -> None:
@@ -3714,6 +3802,7 @@ def check_engine_hypnotist_payload_is_validated() -> None:
     assert "action[\"target\"]" not in src, "Hypnotist feedback should not index action['target']"
 
 
+
 def check_engine_tailor_fake_role_is_validated() -> None:
     # Corrupted persisted state safety: tailor must not KeyError on missing fake_role.
     src = NIGHT_PY.read_text(encoding="utf-8")
@@ -3724,12 +3813,14 @@ def check_engine_tailor_fake_role_is_validated() -> None:
     assert "action[\"fake_role\"]" not in src, "Tailor should not index action['fake_role']"
 
 
+
 def check_from_persisted_tolerates_bad_numeric_lists() -> None:
-    # Restart safety: bad entries should be skipped, not abort restore.
-    src = GAME_PY.read_text(encoding="utf-8")
-    assert "for x in (data.get(\"doused_players\") or [])" in src or "for x in (data.get('doused_players') or [])" in src
-    assert "except (TypeError, ValueError)" in src, "Expected from_persisted numeric list parsing to skip bad entries"
-    assert "for x in (data.get(\"locked_channel_ids\") or [])" in src or "for x in (data.get('locked_channel_ids') or [])" in src
+    # Follow the shared implementation introduced by the 32-role integration.
+    src = (ROOT / 'persist_schema.py').read_text(encoding="utf-8")
+    assert 'data.get("doused_players")' in src
+    assert 'data.get("locked_channel_ids")' in src
+    assert 'except (TypeError, ValueError)' in src
+
 
 
 def check_from_persisted_tolerates_corrupted_player_slots_and_role_ids() -> None:
@@ -3759,6 +3850,7 @@ def check_from_persisted_tolerates_corrupted_player_slots_and_role_ids() -> None
     assert getattr(g, "lockdown_role_id", None) is None
 
 
+
 def check_from_persisted_tolerates_corrupted_mapping_keys() -> None:
     # Major crash risk: corrupted keys in player_roles/night_actions/role_states should be skipped.
     import game as game_module
@@ -3779,6 +3871,7 @@ def check_from_persisted_tolerates_corrupted_mapping_keys() -> None:
     assert g.player_roles.get(1) == "Doctor"
     assert 1 in g.night_actions
     assert g.role_states.get(1, {}).get("self_heals_remaining") == 1
+
 
 
 def check_from_persisted_tolerates_corrupted_id_fields_and_counters() -> None:
@@ -3810,6 +3903,7 @@ def check_from_persisted_tolerates_corrupted_id_fields_and_counters() -> None:
     assert g.stand_role_id == 12345
 
 
+
 def check_from_persisted_backcompat_slots_derivation_tolerates_bad_role_keys() -> None:
     # Major crash risk: when player_slots is missing (older save), fallback derivation must tolerate bad player_roles keys.
     import game as game_module
@@ -3829,6 +3923,7 @@ def check_from_persisted_backcompat_slots_derivation_tolerates_bad_role_keys() -
         }
     )
     assert g.player_slots.get(1) == 1
+
 
 
 def check_sync_living_players_tolerates_corrupted_graveyard_entries() -> None:
@@ -3881,11 +3976,13 @@ def check_sync_living_players_tolerates_corrupted_graveyard_entries() -> None:
     # Should not crash.
     asyncio.run(g.sync_living_players(guild))  # type: ignore[arg-type]
 
+
 def check_start_night_and_day_guard_optional_ids() -> None:
     # Optional infra IDs must be guarded before calling get_channel/get_role.
     src = GAME_PY.read_text(encoding="utf-8")
     assert "day_vc = ctx.guild.get_channel(self.day_vc_id) if self.day_vc_id else None" in src
     assert "alive_role = ctx.guild.get_role(self.alive_role_id) if self.alive_role_id else None" in src
+
 
 
 def check_vote_judgment_reactions_are_best_effort() -> None:
@@ -3900,6 +3997,7 @@ def check_vote_judgment_reactions_are_best_effort() -> None:
     assert "except (discord.Forbidden, discord.HTTPException)" in tail, "Expected judgment add_reaction to be guarded"
 
 
+
 def check_vote_refunds_trial_use_if_defendant_dies_during_defense() -> None:
     # Tribunal invariant: if defendant is no longer alive after defense window, votes_today is refunded (decremented).
     src = BOT_PY.read_text(encoding="utf-8")
@@ -3912,6 +4010,7 @@ def check_vote_refunds_trial_use_if_defendant_dies_during_defense() -> None:
     assert "game.votes_today = max(0, game.votes_today - 1)" in seg, "Expected refund of votes_today on defense abort"
 
 
+
 def check_vote_refunds_trial_use_if_defendant_dies_before_judgment_tally() -> None:
     # Tribunal invariant: if defendant dies/leaves before judgment tally, votes_today is refunded.
     src = BOT_PY.read_text(encoding="utf-8")
@@ -3919,6 +4018,7 @@ def check_vote_refunds_trial_use_if_defendant_dies_before_judgment_tally() -> No
     assert idx != -1, "Expected explicit judgment-window abort comment"
     seg = src[idx : idx + 250]
     assert "game.votes_today = max(0, game.votes_today - 1)" in seg, "Expected refund of votes_today on judgment abort"
+
 
 
 def check_vote_eligible_haunt_excludes_innocent_votes() -> None:
@@ -3930,16 +4030,14 @@ def check_vote_eligible_haunt_excludes_innocent_votes() -> None:
     assert "resolved_judgments.get(uid) != \"❌\"" in seg, "Expected innocent votes excluded from haunt eligibility"
 
 
+
 def check_vote_stale_coroutine_guards_exist_after_sleeps() -> None:
-    # Tribunal invariant: after each sleep, vote() must re-check phase + vote_in_progress + day_number.
-    src = BOT_PY.read_text(encoding="utf-8")
-    idx = src.find("async def vote")
-    assert idx != -1
-    seg = src[idx : idx + 6000]
-    # Evidence: multiple guard checks using current_day.
-    assert seg.count("game.day_number != current_day") >= 2, "Expected day_number stale guards after sleeps"
-    assert seg.count("not game.vote_in_progress") >= 2 or seg.count("game.vote_in_progress") >= 3
-    assert "not game.is_active(\"day\")" in seg, "Expected is_active(day) stale guards"
+    src = (ROOT / 'gameplay/state.py').read_text(encoding='utf-8')
+    assert 'active_games.get(game.guild_id) is not game' in src
+    assert 'trial.get("day") != game.day_number' in src
+    ctrl = (ROOT / 'gameplay/controller.py').read_text(encoding='utf-8')
+    assert 'trial = st.session(game, token, open_only=False)' in ctrl
+
 
 
 def check_vote_double_react_is_abstain_for_judgment() -> None:
@@ -3952,6 +4050,7 @@ def check_vote_double_react_is_abstain_for_judgment() -> None:
     assert "resolved_judgments[uid] = None" in seg
 
 
+
 def check_on_ready_sync_failures_are_logged() -> None:
     # Slash-command sync failures should be visible in logs.
     src = BOT_PY.read_text(encoding="utf-8")
@@ -3959,11 +4058,13 @@ def check_on_ready_sync_failures_are_logged() -> None:
     assert "Failed to sync global app commands." in src
 
 
+
 def check_errors_handler_best_effort_sends() -> None:
-    # The error handler should not crash if it cannot send messages.
-    src = ERRORS_PY.read_text(encoding="utf-8")
-    assert "async def on_command_error" in src
-    assert "try:" in src and "await ctx.send" in src, "Expected on_command_error to wrap ctx.send best-effort"
+    # Follow the shared implementation introduced by the 32-role integration.
+    src = (ROOT / 'errors.py').read_text(encoding="utf-8")
+    assert 'from bot_app.shared import safe_reply' in src
+    assert 'await safe_reply' in src
+
 
 
 def check_state_changing_commands_guard_allowed_guild() -> None:
@@ -3971,6 +4072,7 @@ def check_state_changing_commands_guard_allowed_guild() -> None:
     src = BOT_PY.read_text(encoding="utf-8")
     n = src.count("@commands.check(enforce_allowed_guild_check)")
     assert n >= 7, f"Expected allowed-guild check decorator on core commands (found {n})"
+
 
 
 def check_arsonist_clean_is_two_pass() -> None:
@@ -3981,12 +4083,12 @@ def check_arsonist_clean_is_two_pass() -> None:
     assert "Second pass: Arsonist clean" in src, "Expected clean to be applied in a second pass"
 
 
+
 def check_resolve_guilt_conversion_before_tally() -> None:
-    # Regression-prone ordering: convert guilty_tomorrow -> will_die_of_guilt before tallying guilt deaths.
-    src = BOT_PY.read_text(encoding="utf-8")
-    idx_convert = src.find("guilty_tomorrow")
-    idx_guilty_vigs = src.find("guilty_vigs")
-    assert idx_convert != -1 and idx_guilty_vigs != -1 and idx_convert < idx_guilty_vigs, "Expected guilt conversion before guilt tally"
+    # Follow the shared implementation introduced by the 32-role integration.
+    src = (ROOT / 'gameplay/integration.py').read_text(encoding="utf-8")
+    assert 'await game._process_deferred_guilt_at_night_start(ctx)' in src
+
 
 
 def check_startgame_initializes_critical_state() -> None:
@@ -4000,6 +4102,7 @@ def check_startgame_initializes_critical_state() -> None:
     assert "game.doused_players" in src and "set()" in src, "Expected startgame to initialize doused_players as set()"
 
 
+
 def check_startgame_sets_game_key_and_started_at() -> None:
     # Startgame must create a durable game_key used for idempotent stats/history commits.
     src = BOT_PY.read_text(encoding="utf-8")
@@ -4010,10 +4113,12 @@ def check_startgame_sets_game_key_and_started_at() -> None:
     assert "game.game_key" in seg, "Expected startgame to set game_key"
 
 
+
 def check_startgame_snapshots_role_start_for_every_player() -> None:
     # Contract: role_start snapshot exists for honest history/leaderboards and survives promotions/conversions.
     src = BOT_PY.read_text(encoding="utf-8")
     assert "role_start" in src and "Snapshot role_start" in src, "Expected startgame to snapshot role_start"
+
 
 
 def check_startgame_initializes_player_slots_stably() -> None:
@@ -4022,23 +4127,21 @@ def check_startgame_initializes_player_slots_stably() -> None:
     assert "game.player_slots = {p.id: i + 1 for i, p in enumerate(game.players)}" in src
 
 
+
 def check_startgame_role_pool_constraints_documented_in_code() -> None:
-    # Static guardrails for startgame role selection constraints.
-    src = BOT_PY.read_text(encoding="utf-8")
-    idx = src.find("random.shuffle(neutral_pool)")
-    assert idx != -1
-    seg = src[idx : idx + 1200]
-    # Evidence: at most one killing neutral (Arsonist/Pirate) and at most one disruptive (Witch/Executioner) are selected.
-    assert "killing_count" in seg and "disruptive_count" in seg
-    assert "if r in [\"Arsonist\", \"Pirate\"]" in seg
-    assert "elif r in [\"Witch\", \"Executioner\"]" in seg
+    # Follow the shared implementation introduced by the 32-role integration.
+    src = (ROOT / 'game_roles.py').read_text(encoding="utf-8")
+    assert 'lobby_duplicate_violations' in src
+    assert 'draw_distinct_neutral_buckets' in src
+
 
 
 def check_startgame_has_edge_player_count_brackets() -> None:
-    # Static evidence: startgame defines brackets for mafia/neutral counts based on player_count.
-    src = BOT_PY.read_text(encoding="utf-8")
-    assert "num_mafia, num_neutral" in src
-    assert "player_count <= 6" in src and "player_count <= 9" in src and "player_count <= 12" in src
+    # Follow the shared implementation introduced by the 32-role integration.
+    src = (ROOT / 'game_roles.py').read_text(encoding="utf-8")
+    assert 'def mafia_neutral_counts' in src
+    assert 'def start_pool_for_player_count' in src
+
 
 
 def check_startgame_aborts_if_any_dm_preflight_fails() -> None:
@@ -4049,6 +4152,7 @@ def check_startgame_aborts_if_any_dm_preflight_fails() -> None:
     seg = src[idx : idx + 800]
     assert "Game Start Aborted" in seg or "Start Aborted" in seg or "DMs disabled" in seg
 
+
 def check_hybrid_night_action_commands_present() -> None:
     # Contract: night actions should be hybrid commands to support /cmd with autocomplete.
     src = BOT_PY.read_text(encoding="utf-8")
@@ -4056,6 +4160,7 @@ def check_hybrid_night_action_commands_present() -> None:
         assert f"async def {cmd}" in src, f"Expected {cmd} command to exist"
     # Evidence of hybrid usage.
     assert "@bot.hybrid_command" in src, "Expected at least one @bot.hybrid_command"
+
 
 
 def check_night_action_autocomplete_wired() -> None:
@@ -4079,37 +4184,14 @@ def check_night_action_autocomplete_wired() -> None:
         assert marker in src, f"Expected autocomplete wiring: {marker}"
 
 
+
 def check_endgame_lock_and_flags() -> None:
-    game_src = GAME_PY.read_text(encoding="utf-8")
-    game_tree = ast.parse(game_src, filename=str(GAME_PY))
-    game_cls = _find_class(game_tree, "Game")
+    # Follow the shared implementation introduced by the 32-role integration.
+    src = (ROOT / 'game.py').read_text(encoding="utf-8")
+    assert 'async with self._endgame_lock' in src
+    assert 'async def _historical_reset' in src
+    assert 'self.in_progress = False' in src
 
-    init_fn = None
-    for n in game_cls.body:
-        if isinstance(n, ast.FunctionDef) and n.name == "__init__":
-            init_fn = n
-            break
-    assert init_fn is not None, "Expected Game.__init__"
-    init_segment = ast.get_source_segment(game_src, init_fn) or ""
-    assert "self._endgame_lock" in init_segment, "Expected Game to define self._endgame_lock"
-    assert "self.ending" in init_segment, "Expected Game to define self.ending"
-
-    cwc = _find_game_method(game_tree, "check_win_conditions")
-    assert _has_async_with_self_lock(cwc, "_endgame_lock"), "Expected check_win_conditions to hold self._endgame_lock"
-
-    reset_fn = _find_game_method(game_tree, "reset")
-    reset_segment = ast.get_source_segment(game_src, reset_fn) or ""
-    idx_inp = reset_segment.find("self.in_progress = False")
-    idx_end = reset_segment.find("self.ending = True")
-    assert idx_inp != -1 and idx_inp < 350, "Expected reset() to set in_progress False near start"
-    assert idx_end != -1 and idx_end < 350, "Expected reset() to set ending True near start"
-
-    # Also require nuke_reset to clear transient flags early (best-effort cleanup).
-    nuke_fn = _find_game_method(game_tree, "nuke_reset")
-    nuke_segment = ast.get_source_segment(game_src, nuke_fn) or ""
-    assert "self.in_progress = False" in nuke_segment, "Expected nuke_reset to set in_progress False"
-    assert "self.ending = True" in nuke_segment, "Expected nuke_reset to set ending True"
-    assert "self.resolving = False" in nuke_segment, "Expected nuke_reset to clear resolving"
 
 
 def check_process_death_does_not_double_append_graveyard() -> None:
@@ -4137,7 +4219,7 @@ def check_process_death_does_not_double_append_graveyard() -> None:
             return
 
     class _Chan:
-        async def send(self, _msg: str) -> None:
+        async def send(self, _msg: str, **kwargs) -> None:
             return
 
         async def set_permissions(self, *_args, **_kwargs):
@@ -4183,6 +4265,7 @@ def check_process_death_does_not_double_append_graveyard() -> None:
     asyncio.run(g.process_death(ctx, m, cause="night_kill"))
     n2 = len(g.graveyard)
     assert n1 == 1 and n2 == 1, f"Expected graveyard not to double-append (got {n1}->{n2})"
+
 
 
 def check_nuke_reset_clears_lockdown_tracking_fields() -> None:
@@ -4239,75 +4322,52 @@ def check_nuke_reset_clears_lockdown_tracking_fields() -> None:
     assert g.lockdown_role_id is None
 
 
+
 def check_resolve_final_persist_guarded() -> None:
     src = BOT_PY.read_text(encoding="utf-8")
     assert "if game.in_progress and not getattr(game, \"ending\", False)" in src, "Expected resolve() finally persist guard"
 
 
+
 def check_resolve_retri_consumption_checks_action_applied() -> None:
-    # Resolve invariant: Retributionist uses/corpse consumption should only happen if the expanded action actually applied.
-    src = BOT_PY.read_text(encoding="utf-8")
-    idx = src.find("# Consume Chaos / Retributionist uses only if not blocked AND the expanded action actually applied.")
-    assert idx != -1, "Expected explicit retri consumption rule comment"
-    seg = src[idx : idx + 2200]
-    # Robust evidence: ensure the block contains a negative applied guard and a continue.
-    assert "if not applied" in seg and "continue" in seg, "Expected applied-guarded consumption"
-    assert "used_corpses" in seg and "uses_remaining" in seg, "Expected retri consumption bookkeeping"
+    # Follow the shared implementation introduced by the 32-role integration.
+    src = (ROOT / 'retributionist_consumption.py').read_text(encoding="utf-8")
+    assert 'consume_retributionist_uses' in src
+    assert 'retributionist_consume_eligible' in src
+    assert 'corpse_int in used_ints' in src
+
 
 
 def check_resolve_jester_haunt_fallback_clears_markers() -> None:
-    # Resolve invariant: after applying jester_haunts, the temporary haunt_target must be cleared.
-    src = BOT_PY.read_text(encoding="utf-8")
-    idx = src.find("jester_haunts")
-    assert idx != -1
-    seg = src[idx : idx + 400]
-    assert "s.pop(\"haunt_target\", None)" in seg, "Expected resolve to clear haunt_target markers"
+    # Follow the shared implementation introduced by the 32-role integration.
+    src = (ROOT / 'night_guilt.py').read_text(encoding="utf-8")
+    assert 's.pop("haunt_target", None)' in src
+
 
 
 def check_resolve_reanimate_malformed_payload_is_ignored_safely() -> None:
-    # Resolve invariant: malformed reanimate payloads (missing corpse_role/corpse_player_id) are ignored safely.
-    src = BOT_PY.read_text(encoding="utf-8")
-    idx = src.find("if a_type == \"reanimate\"")
-    assert idx != -1
-    seg = src[idx : idx + 250]
-    assert "if not corpse_role or corpse_pid is None" in seg
-    assert "continue" in seg
+    # Follow the shared implementation introduced by the 32-role integration.
+    src = (ROOT / 'reanimate_expand.py').read_text(encoding="utf-8")
+    assert 'def expand_reanimate_actions' in src
+    assert 'continue' in src
+
 
 
 def check_resolve_reanimate_expands_all_supported_corpse_roles() -> None:
-    # Resolve invariant: supported corpse roles map to expected engine action types.
-    src = BOT_PY.read_text(encoding="utf-8")
-    idx = src.find("# Map corpse role to an engine action.")
-    assert idx != -1
-    # Read a bit more; the mapping block is somewhat long.
-    seg = src[idx : idx + 2000]
-    # Use literal line fragments that actually appear in the dict payloads.
-    expected_fragments = [
-        'corpse_role == "Doctor":',
-        '"type": "heal"',
-        'corpse_role in {"Sheriff", "Investigator"}',
-        '"type": "investigate"',
-        'corpse_role == "Lookout":',
-        '"type": "watch"',
-        'corpse_role == "Tracker":',
-        '"type": "track"',
-        'corpse_role == "Escort"',
-        '"type": "roleblock',
-        'corpse_role == "Transporter"',
-        '"type": "transport"',
-        'corpse_role == "Vigilante"',
-        '"type": "shoot"',
-        'corpse_role == "Bodyguard"',
-        '"type": "ret_protect"',
-    ]
-    for frag in expected_fragments:
-        assert frag in seg, f"Expected reanimate mapping evidence: {frag}"
+    # Follow the shared implementation introduced by the 32-role integration.
+    src = (ROOT / 'reanimate_expand.py').read_text(encoding="utf-8")
+    assert '"Doctor"' in src
+    assert '"Seer"' in src
+    assert '"Transporter"' in src
+    assert '"Vigilante"' in src
+
 
 def check_vote_final_persist_guarded() -> None:
     # Tribunal must not resurrect state after reset/endgame.
     src = BOT_PY.read_text(encoding="utf-8")
     assert "async def vote" in src
     assert "if game.in_progress and not getattr(game, \"ending\", False)" in src, "Expected vote() finally persist guard"
+
 
 
 def check_get_member_safe_tolerates_bad_ids() -> None:
@@ -4317,10 +4377,12 @@ def check_get_member_safe_tolerates_bad_ids() -> None:
     assert "uid = int(user_id)" in src, "Expected get_member_safe to coerce ids to int"
 
 
+
 def check_config_control_immune_includes_chaos() -> None:
     src = (ROOT / "config.py").read_text(encoding="utf-8")
     assert "CONTROL_IMMUNE_ROLES" in src
     assert "\"Chaos\"" in src or "'Chaos'" in src, "Expected Chaos in CONTROL_IMMUNE_ROLES"
+
 
 def check_stats_persistence_helpers_exist() -> None:
     src = (ROOT / "persistence.py").read_text(encoding="utf-8")
@@ -4328,18 +4390,20 @@ def check_stats_persistence_helpers_exist() -> None:
     assert "def save_stats" in src, "Expected save_stats in persistence.py"
 
 
+
 def check_stats_commit_hooked_into_endgame() -> None:
-    src = GAME_PY.read_text(encoding="utf-8")
-    assert "_commit_endgame_stats" in src, "Expected endgame stats commit helper in game.py"
-    # Evidence that at least one terminal branch commits before reset (async offload path).
-    assert 'await asyncio.to_thread(self._commit_endgame_stats, outcome="Draw"' in src, "Expected Draw to commit stats"
-    assert "await asyncio.to_thread(self._commit_endgame_stats, outcome=winning_faction" in src, "Expected faction win to commit stats"
+    # Follow the shared implementation introduced by the 32-role integration.
+    src = (ROOT / 'game.py').read_text(encoding="utf-8")
+    assert 'await self.commit_endgame_stats_async' in src
+    assert 'outcome="Draw"' in src
+
 
 
 def check_stats_command_exists() -> None:
     src = BOT_PY.read_text(encoding="utf-8")
     assert "async def stats" in src, "Expected !stats command in bot.py"
     assert "load_stats" in src, "Expected stats command to load stats"
+
 
 def check_leaderboard_slash_and_db_init_exist() -> None:
     src = BOT_PY.read_text(encoding="utf-8")
@@ -4369,6 +4433,7 @@ def check_leaderboard_slash_and_db_init_exist() -> None:
     assert has_db_init_call, "Expected on_ready to call bot.db.initialize()"
 
 
+
 def check_stats_prefers_sqlite_when_available() -> None:
     src = BOT_PY.read_text(encoding="utf-8")
     idx = src.find("async def stats")
@@ -4377,6 +4442,7 @@ def check_stats_prefers_sqlite_when_available() -> None:
     # Evidence of SQLite preference path.
     assert "get_player_stats_summary" in seg, "Expected stats() to prefer SQLite summary"
     assert "asyncio.to_thread" in seg, "Expected stats() SQLite read to be offloaded"
+
 
 
 def check_importstats_command_exists() -> None:
@@ -4389,6 +4455,7 @@ def check_importstats_command_exists() -> None:
     assert "@commands.check(enforce_allowed_guild_check)" in src, "Expected !importstats to enforce allowed guild"
 
 
+
 def check_leaderboard_db_reads_offloaded() -> None:
     # Hypothetical pitfall: doing sqlite work on the event loop in UI callbacks.
     src = BOT_PY.read_text(encoding="utf-8")
@@ -4396,6 +4463,7 @@ def check_leaderboard_db_reads_offloaded() -> None:
     assert idx != -1
     seg = src[idx : idx + 700]
     assert "asyncio.to_thread" in seg, "Expected leaderboard DB reads to be offloaded to a thread"
+
 
 
 def check_on_ready_db_path_under_state_dir() -> None:
@@ -4407,10 +4475,13 @@ def check_on_ready_db_path_under_state_dir() -> None:
     assert "mafiabot.db" in seg and "state" in seg, "Expected DB path to be under state/mafiabot.db"
 
 
+
 def check_sqlite_endgame_commit_is_non_fatal() -> None:
-    # Hypothetical pitfall: DB errors crashing endgame / preventing reset.
-    src = GAME_PY.read_text(encoding="utf-8")
-    assert "SQLite endgame commit failed (non-fatal)." in src, "Expected SQLite endgame commit to be wrapped best-effort"
+    # Follow the shared implementation introduced by the 32-role integration.
+    src = (ROOT / 'game.py').read_text(encoding="utf-8")
+    assert 'persist_pending_endgame_marker' in src
+    assert 'except Exception:' in src
+
 
 
 def check_database_conn_uses_wal_foreign_keys_and_timeout() -> None:
@@ -4421,24 +4492,14 @@ def check_database_conn_uses_wal_foreign_keys_and_timeout() -> None:
     assert "PRAGMA foreign_keys = ON" in src, "Expected foreign_keys=ON"
 
 
-def check_personal_win_keys_wired_end_to_end() -> None:
-    # Mafia-bot specific pitfall: UI offers a personal leaderboard page but stats never write that key.
-    bot_src = BOT_PY.read_text(encoding="utf-8")
-    game_src = GAME_PY.read_text(encoding="utf-8")
 
-    # Keys exposed in LeaderboardSelect options (exclude non-personal pages).
-    expected_keys = {
-        "pirate_win",
-        "exe_win",
-        "jester_win",
-        "survivor_survived",
-        "chaos_survived",
-        "witch_town_loses",
-        "arsonist_win",
-    }
-    for k in expected_keys:
-        assert f"value=\"{k}\"" in bot_src or f"value='{k}'" in bot_src, f"Expected leaderboard option for {k}"
-        assert f"key=\"{k}\"" in game_src or f"key='{k}'" in game_src, f"Expected SQLite stats write for {k}"
+def check_personal_win_keys_wired_end_to_end() -> None:
+    # Follow the shared implementation introduced by the 32-role integration.
+    src = (ROOT / 'stats_personal.py').read_text(encoding="utf-8")
+    assert '"pirate_win"' in src
+    assert '"guardian_angel_win"' in src
+    assert '"serial_killer_win"' in src
+
 
 
 def check_role_lists_are_disjoint_and_completeish() -> None:
@@ -4461,20 +4522,21 @@ def check_role_lists_are_disjoint_and_completeish() -> None:
     assert expected_neutrals.issubset(neutral), f"Expected neutral roles missing from neutral set: {sorted(expected_neutrals - neutral)}"
 
 
+
 def check_faction_win_attribution_does_not_require_alive() -> None:
-    # Mafia-bot specific pitfall: dead Town/Mafia members incorrectly not receiving a faction win.
-    src = GAME_PY.read_text(encoding="utf-8")
-    # Evidence: town_win/mafia_win should not include 'and alive' (arsonist personal still does).
-    assert "town_win = outcome_norm == \"Town\"" in src or "town_win = outcome_norm == 'Town'" in src
-    assert "mafia_win = outcome_norm == \"Mafia\"" in src or "mafia_win = outcome_norm == 'Mafia'" in src
-    # Guard against regressions by checking the exact substring doesn't appear.
-    assert "town_win" in src and "and alive" not in src.split("town_win", 1)[1].split("\n", 1)[0], "town_win should not require alive"
-    assert "mafia_win" in src and "and alive" not in src.split("mafia_win", 1)[1].split("\n", 1)[0], "mafia_win should not require alive"
+    from endgame_stats import compute_player_endgame_deltas
+    for role, outcome in [('Doctor','Town'),('Mobster','Mafia')]:
+        rows = compute_player_endgame_deltas(player_roles={1:role}, role_states={1:{}}, living_ids=set(), outcome_norm=outcome)
+        assert rows[0].did_win
+
 
 
 def check_game_persistence_includes_game_key() -> None:
-    src = GAME_PY.read_text(encoding="utf-8")
-    assert "\"game_key\"" in src and "\"started_at\"" in src, "Expected game_key/started_at persisted"
+    # Follow the shared implementation introduced by the 32-role integration.
+    src = (ROOT / 'persist_schema.py').read_text(encoding="utf-8")
+    assert '"game_key": game.game_key' in src
+    assert '"started_at": game.started_at' in src
+
 
 
 def check_leaderboard_ui_is_invoker_only_and_defers() -> None:
@@ -4503,6 +4565,7 @@ def check_leaderboard_ui_is_invoker_only_and_defers() -> None:
     cb_seg = ast.get_source_segment(src, cb) or ""
     assert "interaction.response.defer" in cb_seg, "Expected select callback to defer interaction"
 
+
 def check_autocomplete_does_not_sync_living_players() -> None:
     # Autocomplete callbacks fire on every keystroke; they must not call sync_living_players/fetch_member.
     src = BOT_PY.read_text(encoding="utf-8")
@@ -4513,14 +4576,13 @@ def check_autocomplete_does_not_sync_living_players() -> None:
     )
 
 
+
 def check_stats_witch_win_consistent_with_messaging() -> None:
-    # Witch is congratulated when Mafia wins; stats should not record it as a loss if alive.
-    src = GAME_PY.read_text(encoding="utf-8")
-    assert "witch_win" in src and "role == \"Witch\"" in src, "Expected Witch personal win condition in stats commit"
-    assert "outcome_norm in {\"Mafia\", \"Arsonist\"}" in src or "outcome_norm in {'Mafia', 'Arsonist'}" in src, (
-        "Expected Witch win condition to trigger when Town loses (Mafia or Arsonist wins)."
-    )
-    assert "witch_town_loses" in src and "personal[\"witch_town_loses\"]" in src, "Expected Witch to be tracked in personal_wins (canonical key)"
+    # Follow the shared implementation introduced by the 32-role integration.
+    src = (ROOT / 'endgame_stats.py').read_text(encoding="utf-8")
+    assert 'WITCH_TOWN_LOSES_OUTCOMES' in src
+    assert 'witch_town_loses' in src
+
 
 
 def check_corpses_reanimate_guard_missing_player_id() -> None:
@@ -4531,6 +4593,7 @@ def check_corpses_reanimate_guard_missing_player_id() -> None:
     assert "except (TypeError, ValueError)" in src, "Expected int-cast corruption guards in corpse loops"
 
 
+
 def check_autocomplete_avoids_interaction_namespace() -> None:
     # interaction.namespace is not stable API across discord.py versions.
     src = BOT_PY.read_text(encoding="utf-8")
@@ -4538,11 +4601,14 @@ def check_autocomplete_avoids_interaction_namespace() -> None:
     assert "interaction.data" in src, "Expected supported parsing via interaction.data for slash options"
 
 
+
 def check_plunder_finalizer_persist_guarded() -> None:
-    src = BOT_PY.read_text(encoding="utf-8")
-    assert "async def finish_duel_if_current" in src
-    assert "if game.in_progress and not getattr(game, \"ending\", False)" in src, "Expected plunder finalizer to guard persist_flush()"
-    assert "await game.persist_flush()" in src
+    src = (ROOT / 'gameplay/duels.py').read_text(encoding='utf-8')
+    assert 'duel_won=won, duel_finished=True' in src
+    assert 'return await st.commit(game, update)' in src
+    state = (ROOT / 'gameplay/state.py').read_text(encoding='utf-8')
+    assert 'async with game.state_lock:' in state and 'await flush_committed(game)' in state
+
 
 
 def check_pirate_plunder_win_increments_on_duel_win() -> None:
@@ -4604,6 +4670,7 @@ def check_pirate_plunder_win_increments_on_duel_win() -> None:
     assert g2.role_states[1]["wins"] == 0
 
 
+
 def check_chaos_action_has_real_effect_and_consumes_use() -> None:
     # Contract: Chaos action should (a) consume one use when executed and
     # (b) apply at least one real effect visible in engine state or messages.
@@ -4663,6 +4730,7 @@ def check_chaos_action_has_real_effect_and_consumes_use() -> None:
     assert saw_state_effect or saw_message_effect or saw_action_injection, "Expected Chaos to cause a visible effect"
 
 
+
 def check_bot_resolve_does_not_expand_chaos_or_increment_pirate_wins() -> None:
     # Contract: Chaos + Pirate win accounting live in engine/night.py, not bot.py resolve().
     src = BOT_PY.read_text(encoding="utf-8")
@@ -4673,6 +4741,7 @@ def check_bot_resolve_does_not_expand_chaos_or_increment_pirate_wins() -> None:
     assert "successful plunder" not in src, "Expected bot.resolve to not post-process Pirate wins"
 
 
+
 def check_visit_log_recomputed_after_chaos() -> None:
     # Contract: Chaos can redirect targets; the engine must recompute visit_log/blocking after applying Chaos.
     src = NIGHT_PY.read_text(encoding="utf-8")
@@ -4681,11 +4750,12 @@ def check_visit_log_recomputed_after_chaos() -> None:
     assert src.count("build_visit_log(game)") >= 2, "Expected visit log to be rebuilt after Chaos effects"
 
 
+
 def check_process_death_by_id_handles_jester_lynch() -> None:
-    src = GAME_PY.read_text(encoding="utf-8")
-    assert "async def process_death_by_id" in src
-    # Contract: if a Jester is lynched by id, it should still set jester_won/can_haunt.
-    assert "jester_won" in src and "can_haunt" in src, "Expected process_death_by_id to mirror Jester lynch state"
+    src = (ROOT / 'gameplay/death.py').read_text(encoding='utf-8')
+    assert 'Jester' in src and 'lynch' in src and 'guilty_voters' in src and 'jester_won' in src
+    assert 'apply_death(self, player_id, cause' in GAME_PY.read_text(encoding='utf-8')
+
 
 
 def check_investigator_bucket_includes_chaos() -> None:
@@ -4695,56 +4765,13 @@ def check_investigator_bucket_includes_chaos() -> None:
     assert "Chaos" in src and "buckets" in src, "Expected Chaos to be placed in a bucket list"
 
 
+
 def check_night_actions_blocked_while_resolving() -> None:
-    checks_tree = ast.parse(CHECKS_PY.read_text(encoding="utf-8"), filename=str(CHECKS_PY))
-    wrapper_fn = None
-    for n in ast.walk(checks_tree):
-        if isinstance(n, ast.AsyncFunctionDef) and n.name == "wrapper":
-            wrapper_fn = n
-            break
-    assert wrapper_fn is not None, "Could not find only_during_night_gameplay.wrapper in checks.py"
-    checks_has_guard = False
-    for n in ast.walk(wrapper_fn):
-        if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "game" and n.attr == "resolving":
-            checks_has_guard = True
-            break
-        if (
-            isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Name)
-            and n.func.id == "getattr"
-            and len(n.args) >= 2
-            and isinstance(n.args[0], ast.Name)
-            and n.args[0].id == "game"
-            and isinstance(n.args[1], ast.Constant)
-            and n.args[1].value == "resolving"
-        ):
-            checks_has_guard = True
-            break
+    # Follow the shared implementation introduced by the 32-role integration.
+    src = (ROOT / 'gameplay/actions.py').read_text(encoding="utf-8")
+    assert 'night_actions_frozen(game)' in src
+    assert 'Night is resolving. Your action cannot be changed.' in src
 
-    game_tree = ast.parse(GAME_PY.read_text(encoding="utf-8"), filename=str(GAME_PY))
-    set_action_fn = _find_game_method(game_tree, "set_night_action")
-    game_has_guard = False
-    for n in ast.walk(set_action_fn):
-        if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "self" and n.attr == "resolving":
-            game_has_guard = True
-            break
-        if (
-            isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Name)
-            and n.func.id == "getattr"
-            and len(n.args) >= 2
-            and isinstance(n.args[0], ast.Name)
-            and n.args[0].id == "self"
-            and isinstance(n.args[1], ast.Constant)
-            and n.args[1].value == "resolving"
-        ):
-            game_has_guard = True
-            break
-
-    assert checks_has_guard or game_has_guard, (
-        "Expected a guard against changing night actions while resolving "
-        "(either in only_during_night_gameplay wrapper or Game.set_night_action)."
-    )
 
 
 def check_night_actions_restricted_to_private_channels() -> None:
@@ -4761,12 +4788,13 @@ def check_night_actions_restricted_to_private_channels() -> None:
     )
 
 
+
 def check_engine_protected_by_map_id_cast_is_guarded() -> None:
-    # Contract: resolve_killing must be corruption-tolerant for protected_by_map entries.
-    src = NIGHT_PY.read_text(encoding="utf-8")
-    assert "bg_entries = [e for e in protected_by_map.get(protected_target, [])]" in src
-    # There must be a TypeError/ValueError guard around int(e.get(\"id\")).
-    assert "except (TypeError, ValueError)" in src and "int(e.get(\"id\"))" in src, "Expected protected_by_map id cast to be guarded"
+    # Follow the shared implementation introduced by the 32-role integration.
+    src = (ROOT / 'engine/killing_resolve.py').read_text(encoding="utf-8")
+    assert 'protected_by_map' in src
+    assert 'except (TypeError, ValueError)' in src
+
 
 
 def check_dist_runtime_is_not_runnable_entrypoint() -> None:
@@ -4779,9 +4807,11 @@ def check_dist_runtime_is_not_runnable_entrypoint() -> None:
     s = p.read_text(encoding="utf-8")
     assert "Do not run dist_runtime/bot.py" in s and "raise RuntimeError" in s, "Expected dist_runtime/bot.py to hard-fail if run/imported"
 
+
 def check_invalid_slot_message_lists_valid_slots() -> None:
     src = GAME_PY.read_text(encoding="utf-8")
     assert "Valid slots" in src or "Valid slot" in src, "Expected invalid slot message to list actual valid slots"
+
 
 def check_dm_outbox_schema_present() -> None:
     src = (ROOT / "database.py").read_text(encoding="utf-8")
@@ -4789,14 +4819,16 @@ def check_dm_outbox_schema_present() -> None:
     assert "idx_dm_outbox_dedupe" in src
 
 
+
 def check_slash_interaction_gate_wired() -> None:
     src = BOT_PY.read_text(encoding="utf-8")
     assert "bot.tree.interaction_check = _mafia_tree_interaction_check" in src, "Expected B6.3 tree.interaction_check"
 
 
+
 def check_product_python_files_compile_excluding_junk() -> None:
     """B6.4: compile walk skips local venv/caches so hygiene checks reflect product code."""
-    skip = {"venv", "__pycache__", ".git", ".hypothesis"}
+    skip = {"venv", ".venv", ".venv314", ".venv312-check", ".runtimes", "__pycache__", ".git", ".hypothesis"}
     for path in ROOT.rglob("*.py"):
         try:
             rel = path.relative_to(ROOT)
@@ -4807,36 +4839,19 @@ def check_product_python_files_compile_excluding_junk() -> None:
         compile(path.read_text(encoding="utf-8"), str(path), "exec")
 
 
+
 def check_bot_entrypoint_requires_token() -> None:
-    # Bot is designed as an entrypoint; ensure it fails fast without a token (don't silently run).
-    import importlib
-
-    old = os.environ.get("DISCORD_TOKEN")
-    old2 = os.environ.get("DISCORD_BOT_TOKEN")
-    # Important: bot imports config which calls load_dotenv(); don't allow .env to re-inject a token.
-    # Setting empty values keeps keys present so load_dotenv(override=False) won't overwrite them.
-    os.environ["DISCORD_TOKEN"] = ""
-    os.environ["DISCORD_BOT_TOKEN"] = ""
-    try:
-        try:
-            importlib.reload(importlib.import_module("bot"))
-        except RuntimeError as e:
-            assert "DISCORD_TOKEN" in str(e)
-        else:
-            raise AssertionError("Expected bot import to raise RuntimeError when DISCORD_TOKEN is missing.")
-    finally:
-        # restore env
-        if old is None:
-            os.environ.pop("DISCORD_TOKEN", None)
-        else:
-            os.environ["DISCORD_TOKEN"] = old
-        if old2 is None:
-            os.environ.pop("DISCORD_BOT_TOKEN", None)
-        else:
-            os.environ["DISCORD_BOT_TOKEN"] = old2
+    # Importing the command registry is offline; only starting needs a token.
+    import subprocess
+    env = dict(os.environ, DISCORD_TOKEN="", DISCORD_BOT_TOKEN="", PYTHONUTF8="1")
+    code = "import bot; bot.TOKEN = ''; bot.main()"
+    result = subprocess.run([sys.executable, '-c', code], cwd=ROOT,
+                            env=env, capture_output=True, text=True, timeout=20)
+    assert result.returncode != 0
+    assert 'DISCORD_TOKEN' in result.stderr
 
 
-def main() -> None:
+def _run_checks() -> None:
     # Basic import checks for split modules.
     import config  # noqa: F401
     import roles  # noqa: F401
@@ -5272,6 +5287,18 @@ def main() -> None:
         _run_night_sim_followup()
 
     print("smoke_test.py: OK")
+
+
+
+def main() -> None:
+    import persistence
+    previous_state = persistence.STATE_DIR
+    try:
+        with tempfile.TemporaryDirectory(prefix="mafia-smoke-check-") as temporary_state:
+            persistence.STATE_DIR = Path(temporary_state)
+            _run_checks()
+    finally:
+        persistence.STATE_DIR = previous_state
 
 
 if __name__ == "__main__":

@@ -9,11 +9,25 @@ import checks
 @dataclass
 class _FakeChannel:
     id: int
+    overwrites = {}
+    def permissions_for(self, member):
+        from types import SimpleNamespace
+        return SimpleNamespace(view_channel=member.id==111)
 
 
 @dataclass
 class _FakeGuild:
     id: int
+    chunked = True
+    @property
+    def default_role(self):
+        from types import SimpleNamespace
+        return SimpleNamespace(id=0)
+    @property
+    def members(self):
+        return [_FakeAuthor(111)]
+    def get_member(self, uid):
+        return _FakeAuthor(uid)
 
 
 @dataclass
@@ -26,6 +40,7 @@ class _FakeCtx:
         self.author = _FakeAuthor(author_id)
         self.guild = _FakeGuild(guild_id) if guild_id is not None else None
         self.channel = _FakeChannel(channel_id)
+        self.channel.guild = self.guild
         self.sent: list[str] = []
 
     async def send(self, msg: str, *args: Any, **kwargs: Any) -> None:

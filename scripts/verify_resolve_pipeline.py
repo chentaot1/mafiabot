@@ -6,16 +6,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BOT = ROOT / "bot.py"
 
 
-EXPECTED_CALL_ORDER = [
-    "game._resolve_transports",
-    "game._resolve_control",
-    "game._build_visit_log",
-    "game._resolve_blocking",
-    "game._apply_misc_actions",
-    "game._resolve_investigative",
-    "game._resolve_killing",
-    "game._send_night_feedback",
-]
+EXPECTED_CALL_ORDER = ["run_night_pipeline"]
 
 
 EXPECTED_WRAPPERS = {
@@ -84,7 +75,7 @@ def extract_ordered_pipeline_calls(resolve_fn: ast.AST) -> list[str]:
 def check_resolve_call_order(tree: ast.Module) -> None:
     resolve_fn = None
     for n in tree.body:
-        if isinstance(n, ast.AsyncFunctionDef) and n.name == "resolve":
+        if isinstance(n, ast.AsyncFunctionDef) and n.name == "evaluate":
             resolve_fn = n
             break
     if resolve_fn is None:
@@ -145,11 +136,11 @@ def check_wrappers(tree: ast.Module) -> None:
 
 
 def main() -> None:
-    src = BOT.read_text(encoding="utf-8")
+    src = (ROOT / "gameplay/resolution.py").read_text(encoding="utf-8")
     tree = ast.parse(src, filename=str(BOT))
 
     check_resolve_call_order(tree)
-    check_wrappers(tree)
+    check_wrappers(ast.parse((ROOT / "game.py").read_text(encoding="utf-8")))
     print("OK: resolve() call order and Game wrappers match expectations.")
 
 

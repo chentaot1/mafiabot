@@ -98,6 +98,17 @@ def assert_post_night_pipeline_invariants(game: Any, out: Dict[str, Any]) -> Non
     if living_ids:
         assert set(_iter_ints(deaths)).issubset(living_ids), f"Deaths not subset of living: deaths={deaths} living={living_ids}"
 
+    # Engine should explain every death with a cause, and only deaths.
+    # This catches silent logic regressions where deaths are applied but causes are missing,
+    # or where causes are recorded for survivors.
+    causes = getattr(game, "night_death_causes", {}) or {}
+    if isinstance(causes, Mapping):
+        cause_ids = {int(k) for k in causes.keys() if isinstance(k, int) or (isinstance(k, str) and str(k).isdigit())}
+        death_ids = set(_iter_ints(deaths))
+        assert (
+            cause_ids == death_ids
+        ), f"night_death_causes keys must equal deaths: deaths={sorted(death_ids)} causes={sorted(cause_ids)}"
+
     healed_by_map = out["healed_by_map"]
     protected_by_map = out["protected_by_map"]
     assert isinstance(healed_by_map, dict)

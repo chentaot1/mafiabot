@@ -31,7 +31,7 @@ class _PhaseMember:
     mention: str
     voice: None = None
 
-    async def send(self, _msg: str) -> None:
+    async def send(self, _msg: str, **kwargs) -> None:
         return
 
     async def add_roles(self, *_roles: object) -> None:
@@ -63,7 +63,7 @@ class _PhaseCtx:
     def __init__(self, guild: _PhaseGuild) -> None:
         self.guild = guild
 
-    async def send(self, _msg: str) -> None:
+    async def send(self, _msg: str, **kwargs) -> None:
         return
 
 
@@ -250,7 +250,7 @@ class _TrMember:
     roles: list[object]
     mention: str
 
-    async def send(self, _msg: str) -> None:
+    async def send(self, _msg: str, **kwargs) -> None:
         return
 
     async def add_roles(self, *_roles: object) -> None:

@@ -1,485 +1,314 @@
-# MafiaSalem — Server Member Guide (Roles + FAQ)
+# MafiaBot — Player and Role Guide
 
-This guide is for **server members** playing the bot. It’s intentionally detailed (more than `!myrole`) so new players can learn quickly.
+MafiaBot runs an overseer-led social deduction game on Discord. There are 32 configured roles: 15 Town, 8 Mafia, and 9 neutral. Players use stable numbered seats, so a death never changes another player's target number.
 
-If something here conflicts with what the bot actually does, assume the bot/code is correct and update this doc.
+## Starting and playing
 
-## How this bot works
+Join with `!join`; the overseer starts with `!startgame`. The game checks that players can receive DMs before dealing roles. Players should keep DMs enabled for role assignments and private feedback. The bot creates or reuses the game's text/voice channels and roles; server permissions must be configured correctly.
 
-### Phases
+Day is for discussion and tribunal voting. The overseer starts a trial with `!vote`; private nomination controls lead to defense, judgment, and a verdict. A revealed Mayor has double vote weight. A tie or no nomination spares the town from that trial. There are at most two trials per day.
 
-- **Day**: discussion + trials (`!vote`)
-- **Night**: submit actions, then the GM resolves (`!resolve`)
+At night, use `/actions` to open your private panel. Choose an ability, select its targets, and press Submit. Nothing in a draft is saved before submission. Prefix commands also work in DMs; supported hybrid commands work in verified private player channels. Public role-action submissions are rejected. Reopening `/actions` gives the current phase's controls if an old panel has expired.
 
-### Where to submit night actions (secrecy)
+The overseer resolves with `!resolve`. Valid resubmissions replace earlier actions until resolution freezes them. Pirate duels must finish first. Delayed guilt, conversions, and faction/personal objectives can change the outcome after an action was accepted.
 
-You have two supported “secret” ways to submit night actions:
+## Lobby composition and resources
 
-- **DM the bot (prefix commands)**: `!heal 3`, `!shoot 7`, etc.
-- **Use your private player channel** in the server (prefix or slash)
+Five-player games use one Investigative Town, one Protective Town, two Random Town, and a Mobster. Six/seven-player games add one/two neutral slots. Larger games use the weighted pools described in the README. Roles can repeat except Mayor, Scary Grandma, Retributionist, Mobster, Pirate, Arsonist, and Guardian Angel.
 
-Using night action commands in random public channels is rejected to prevent leaks.
+Retributionist, Survivor, Scary Grandma, Gatekeeper, and Chaos start with one charge in games of seven or fewer players and two above seven. Other quantities in the role cards below apply as written. When a card says two charges, the small-lobby adjustment still applies.
 
-### Slash vs prefix
+`!myrole` gives your role card in a DM. `!players` lists seat numbers; `!will` opens or clears your will, subject to the current game's eligibility checks. `/leaderboard` and `!stats` show recorded results. Neutral personal victories are separate from faction outcomes.
 
-- **In-server**: most night actions are **hybrid** (`!command` or `/command`)
-- **In DMs**: only **prefix** commands exist (no slash)
+## Role roster
 
-### Targeting
-
-Most actions target a **slot number** (example: `!heal 3`). Slot numbers are assigned at game start and **do not change** as people die.
-
-### Changing your mind
-
-Submitting again replaces your previous action.
-
----
-
-## Core commands (players)
-
-### Lobby
-
-- `!join`
-- `!players`
-
-### Utility (DM)
-
-- `!myrole`
-- `!will`
-
-### Special
-
-- `!reveal` — Mayor (day, server)
-- `!haunt [slot]` — Jester (DM only, after lynch)
-
----
-
-## Night action commands (submit in DM or your private channel)
-
-### Town (night actions)
-
-- `!alert` — Scary Grandma
-- `!heal <slot>` — Doctor
-- `!investigate <slot>` — Sheriff, Investigator
-- `!protect <slot>` — Bodyguard
-- `!corpses` — Retributionist (list usable corpses)
-- `!reanimate <corpse> <target>` — Retributionist
-- `!roleblock <slot>` — Escort
-- `!shoot <slot>` — Vigilante
-- `!track <slot>` — Tracker
-- `!transport <slot1> <slot2>` — Transporter
-- `!watch <slot>` — Lookout
-
-### Mafia (night actions)
-
-- `!frame <slot>` — Framer (Nights 1–2)
-- `!guard <slot>` — Gatekeeper
-- `!hide <slot>` — Gravedigger
-- `!hypnotize <slot> <type>` — Hypnotist
-- `!investigate <slot>` — Mole
-- `!kill <slot>` — Mobster
-- `!roleblock <slot>` — Consort
-- `!tailor <slot> <fake_role>` — Tailor
-
-### Neutral (night actions)
-
-- `!chaos <slot1> <slot2>` — Chaos
-- `!clean` — Arsonist
-- `!control <slot1> <slot2>` — Witch
-- `!douse <slot>` — Arsonist
-- `!ignite` — Arsonist
-- `!plunder <slot>` — Pirate
-- `!vest` — Survivor
-
----
-
-## Attack/defense (important interactions)
-
-- **Doctor heal**, **Survivor vest**, and **Scary Grandma alert** can stop normal night kills.
-- **Ignite** (Arsonist) is an “unstoppable” mass-kill that burns through defenses.
-- **Arsonist** has basic defense against normal night kills.
-- **Witch** has a special **Night 1 shield** that blocks one normal kill on Night 1.
-
-## Immunities (important lists)
-
-These are **hard-coded** role immunities in this bot:
-
-- **Roleblock-immune roles**: Scary Grandma, Witch, Consort, Escort, Pirate, Transporter
-- **Control-immune roles**: Transporter, Scary Grandma, Witch, Pirate, Chaos
-
----
-
-## Roles (in-depth)
 
 ### Town
 
-#### Retributionist
-
-- **Stats**: Faction: Town | Attack: None | Defense: None
-- **Goal**: Town wins
-- **Commands**
-  - `!corpses` (shows the numbered list of usable corpses)
-  - `!reanimate <corpse> <target>` (or `!reanimate <corpse> <t1> <t2>` for Transporter corpse)
-- **Uses**: 2 total
-- **Key rules**
-  - Can’t use **hidden corpses**.
-  - Each corpse can only be used once.
-  - Only certain **Town** corpses are usable: Doctor, Sheriff, Investigator, Lookout, Tracker, Escort, Transporter, Bodyguard, Vigilante.
-  - The `<corpse>` number refers to the list shown by `!corpses` (not the overall graveyard).
-- **How to use it well**
-  - Save a reanimate for a “swing” night (confirming evil, preventing a kill, or creating an extra death).
-  - Using a **Doctor** or **Bodyguard** corpse is usually strongest defensively; using an investigative corpse is strongest for information.
-
-#### Doctor
-
-- **Stats**: Faction: Town | Attack: None | Defense: Basic (self-heal only)
-- **Command**: `!heal <slot>`
-- **Self-heal**: once per game
-- **Can’t heal**: revealed Mayor
-- **Feedback**: if your heal mattered, you get ToS-like “Your target was attacked last night!”
-- **Extra mechanics**
-  - Your heal blocks normal night kills, but **ignite** can still kill through it.
-  - If you healed someone during an unstoppable death (ignite), you get explicit feedback that your heal had no effect.
-- **Tips**
-  - Don’t tunnel on self-heal. A correct heal on a confirmed Town is often game-winning.
-
-#### Sheriff
-
-- **Stats**: Faction: Town | Attack: None | Defense: None
-- **Command**: `!investigate <slot>`
-- **Result**: innocent vs suspicious
-- **Suspicious if**: Mafia, Arsonist, doused, or framed
-- **Extra mechanics**
-  - **Framed** targets read suspicious.
-  - **Doused** targets read suspicious.
-- **How to interpret results**
-  - “Suspicious” is a strong lead, not an auto-lynch: framing and dousing exist.
-
-#### Investigator
-
-- **Stats**: Faction: Town | Attack: None | Defense: None
-- **Command**: `!investigate <slot>`
-- **Result**: role bucket list (ToS-style)
-- **Framed**: appears as Framer bucket
-- **Doused/Arsonist**: appears as Arsonist bucket
-- **Extra mechanics**
-  - If framed, the apparent result is treated as if the target is **Framer**.
-  - If doused (or Arsonist), the apparent result is treated as **Arsonist**.
-- **Tips**
-  - Buckets are designed for this bot’s role list (smaller lobbies). Combine with claims and vote behavior.
-
-#### Lookout
-
-- **Stats**: Faction: Town | Attack: None | Defense: None
-- **Command**: `!watch <slot>`
-- **Result**: names of visitors
-- **Note**: Gatekeeper is excluded from visit logs
-- **Extra mechanics**
-  - Lookout uses the bot’s “visit log” — actions like control/transport count as visits in special ways.
-  - **Gatekeeper** is intentionally excluded from the visit log, so you won’t see them as a visitor.
-- **Tips**
-  - Watch likely-kill targets (confirmed Town, revealed Mayor, etc.) to catch attackers/roleblockers.
-
-#### Tracker
-
-- **Stats**: Faction: Town | Attack: None | Defense: None
-- **Command**: `!track <slot>`
-- **Result**: where your target visited
-- **Tips**
-  - Tracking a roleblocker/attacker can be as valuable as tracking a quiet player.
-
-#### Vigilante
-
-- **Stats**: Faction: Town | Attack: Basic | Defense: None
-- **Command**: `!shoot <slot>`
-- **Ammo**: 1 bullet total
-- **Guilt**: if you successfully kill Town, you die of guilt the next day
-- **Witch**: Witch can force a shot even if you submitted no action (if you still have shots)
-- **Extra mechanics**
-  - Guilt only applies if your shot actually **killed** a Town member (not if they were healed/defended).
-- **How to use it well**
-  - Shoot only when you have strong evidence; coordinate with confirms when possible.
 
 #### Bodyguard
 
-- **Stats**: Faction: Town | Attack: Basic | Defense: Basic (self-protect only)
-- **Command**: `!protect <slot>`
-- **Protect others**: 1 use total
-- **Self-protect**: 1 time (vest-style protection)
-- **If your protected target is attacked**: you can counter-kill an attacker, and you may die too
-- **Pirate**: if Pirate wins a duel on your guarded target, you can still kill Pirate first
-- **Extra mechanics**
-  - Multiple Bodyguards can protect the same person; only the first counter-kills (others get “someone else protected first”).
-- **Tips**
-  - Protect publicly valuable targets (revealed Mayor, confirmed investigator, etc.).
-  - Self-protect is best used when you are a likely night-kill, not just “because it’s available.”
+**Faction:** Town
+**Stats:** ⚔️ Powerful counterattack when guarding / 🛡️ Basic (self-vest + one off-self guard)
+**Goal:** Lynch all evildoers.
+**Abilities:** `!protect <slot>`. **One** protect on another player per game, plus **one** self-vest night. On a successful guard vs a kill, you counter with a **Powerful** attack (pierces Basic defense); you may die on guard (`dies_on_guard` rules). If multiple Bodyguards protect the same target, **only the first** counters; others get feedback only.
+
+
+#### Deputy
+
+**Faction:** Town
+**Stats:** Unstoppable Attack (day) / No Defense
+**Goal:** Lynch all evildoers.
+**Abilities:** From **Day 2**, **1** daytime `!shoot <slot>` from **DM or private player channel**. Gun reads framed/doused/Mafia/killing neutrals as evil. **Unstoppable** pierces Basic/Powerful passive defense (e.g. Executioner, SK, Arsonist); wrong shot kills target then you. **One bullet per Deputy** for the entire game.
+
+
+#### Doctor
+
+**Faction:** Town
+**Stats:** No Attack / No Defense (heal grants **Powerful** defense to target that night)
+**Goal:** Lynch all evildoers.
+**Abilities:** `!heal <slot>` nightly. **One self-heal** per game. **No** revealed Mayor.
+
 
 #### Escort
 
-- **Stats**: Faction: Town | Attack: None | Defense: None
-- **Command**: `!roleblock <slot>`
-- **Extra mechanics**
-  - **You are roleblock-immune** in this bot (Escort is in the roleblock-immunity list).
-- **Tips**
-  - Blocking suspected attackers is strong, but blocking informational roles can also “test” claims.
+**Faction:** Town
+**Stats:** No Attack / No Defense
+**Goal:** Lynch all evildoers.
+**Abilities:** `!roleblock <slot>` nightly (visit follows **Transporter**). Cannot roleblock **roleblock-immune** roles. **Serial Killer** (aggressive): immune + may counter-kill you. **Gatekeeper** guards block you as a **Town** visitor; **Consort** (Mafia) is not blocked the same way.
 
-#### Scary Grandma
 
-- **Stats**: Faction: Town | Attack: Basic | Defense: Basic (on alert only)
-- **Command**: `!alert`
-- **Uses**: 2 alerts
-- **Effect**: kills visitors; defended against normal kills while on alert
-- **Ignite**: ignite burns through alert
-- **Extra mechanics**
-  - Alert turns visitor info into deaths. If you’re on alert, visitors can die even if you die later to ignite.
-- **Tips**
-  - Use alert when you expect visits: after a suspicious day, after a public claim, or when you think you’re being targeted.
+#### Investigator
 
-#### Transporter
+**Faction:** Town
+**Stats:** No Attack / No Defense
+**Goal:** Lynch all evildoers.
+**Abilities:** `!investigate <slot>` → role **bucket** (ToS-style). Frames/douses skew buckets like normal investigations.
 
-- **Stats**: Faction: Town | Attack: None | Defense: None
-- **Command**: `!transport <slot1> <slot2>`
-- **Effect**: swaps targets for most actions
-- **Not redirected**: Pirate actions, vest/clean, transport itself
-- **Extra mechanics**
-  - Transport applies before most actions and can redirect kills/investigations/blocks.
-  - Transport does **not** redirect some self-only actions (vest/clean) and certain special actions (pirate).
-- **Tips**
-  - Transporting yourself with a high-value Town can “catch” kills and waste Mafia actions.
+
+#### Lookout
+
+**Faction:** Town
+**Stats:** No Attack / No Defense
+**Goal:** Lynch all evildoers.
+**Abilities:** `!watch <slot>` → visitor names (you do not see yourself). **Gatekeeper** guards and **Hypnotist** hypnotizes **count as visits**. Not visits: vest / alert / bg_vest / clean. Chaos/Retributionist corpse `watch` can send visitor DMs without being Lookout.
+
 
 #### Mayor
 
-- **Stats**: Faction: Town | Attack: None | Defense: None
-- **Command**: `!reveal`
-- **Voting**: double vote once revealed
-- **Important**: cannot be healed after reveal
-- **How to reveal**
-  - Reveal when it changes the vote math or locks in a lynch. Revealing too early paints a target.
+**Faction:** Town
+**Stats:** No Attack / No Defense
+**Goal:** Lynch all evildoers.
+**Abilities:** Day `!reveal` → vote weight **2**. **Cannot** be healed after reveal.
 
----
+
+#### Psychic
+
+**Faction:** Town
+**Stats:** No Attack / No Defense
+**Goal:** Lynch all evildoers.
+**Abilities:** **Passive** visions after each **resolve** (odd: 1 evil among 3 slots; even: 1 good among 2). **Roleblocked** = no vision. Witch control can **steal** the vision text.
+
+
+#### Retributionist
+
+**Faction:** Town (unique)
+**Stats:** No Attack / No Defense
+**Goal:** Lynch all evildoers.
+**Abilities:** **2 uses** (1 at ≤7p). `!corpses`, then `!reanimate <corpse#> <slot>`. Usable Town corpses: Doctor, Sheriff, Investigator, Lookout, Tracker, Escort, Bodyguard, Vigilante, Transporter (two targets; full list from `!corpses`). Not Mayor, Psychic, Deputy, Seer, Scary Grandma, or other Retributionists. Hidden corpses (Gravedigger) unusable; each corpse once. You visit the corpse; the corpse performs the ability (follows **Transporter** like a normal visit). **Escort** corpse roleblocking an aggressive **Serial Killer** can get **you** counter-killed. **Bodyguard** corpse: corpse counters the attack — **you do not die** on guard. **Vigilante** corpse: **guilt** if the shot kills Town. **Doctor** corpse: cannot heal a **revealed Mayor** (use still spent). Roleblock- and Witch-control-immune.
+
+
+#### Scary Grandma
+
+**Faction:** Town
+**Stats:** Powerful Attack (on alert) / Basic Defense (on alert)
+**Goal:** Lynch all evildoers.
+**Abilities:** **2** `!alert` — visitors die (powerful; pierces basic defense). **Roleblock-** and **control-immune**.
+
+
+#### Seer
+
+**Faction:** Town
+**Stats:** No Attack / No Defense
+**Goal:** Lynch all evildoers.
+**Abilities:** `!gaze <s1> <s2>` — **Friends** vs **Enemies** from bucketed alignment (GA/Jester/Town bucket; Mafia bucket; NK bucket; hostile neutrals). **Tailor** fake death roles do **not** affect gaze. Revealed Mayor cannot be gazed. **Gatekeeper / roleblock** cancels gaze. **Witch** on an idle Seer forces both gaze slots to the Witch's target (useless **Friends** self-pair); if the Seer already picked targets, only the **first** slot is overwritten.
+
+
+#### Sheriff
+
+**Faction:** Town
+**Stats:** No Attack / No Defense
+**Goal:** Lynch all evildoers.
+**Abilities:** `!investigate <slot>` → innocent / suspicious. Framed, doused, Mafia, and Arsonist read suspicious.
+
+
+#### Tracker
+
+**Faction:** Town
+**Stats:** No Attack / No Defense
+**Goal:** Lynch all evildoers.
+**Abilities:** `!track <slot>` → who they visited. **Transporter** and roleblocks can change outcomes.
+
+
+#### Transporter
+
+**Faction:** Town
+**Stats:** No Attack / No Defense
+**Goal:** Lynch all evildoers.
+**Abilities:** `!transport <s1> <s2>` swaps targets for most actions. **Roleblock-** and **control-immune**.
+
+
+#### Vigilante
+
+**Faction:** Town
+**Stats:** Basic Attack / No Defense
+**Goal:** Lynch all evildoers.
+**Abilities:** **1** `!shoot <slot>`. **Guilt** (die the **following night**) only if the shot **kills** a role in the Town bucket (`TOWN_ROLES`; not Neutral Benign).
+
 
 ### Mafia
 
-#### Mobster
-
-- **Stats**: Faction: Mafia | Attack: Basic | Defense: None
-- **Command**: `!kill <slot>`
-- **Tips**
-  - Coordinate with roleblocks/frames to reduce Town info and protect your kill.
 
 #### Consort
 
-- **Stats**: Faction: Mafia | Attack: None | Defense: None
-- **Command**: `!roleblock <slot>`
-- **Extra mechanics**
-  - **You are roleblock-immune** in this bot (Consort is in the roleblock-immunity list).
-- **Tips**
-  - Block investigators/lookouts/trackers, or block protection roles before a key kill.
+**Faction:** Mafia
+**Stats:** No Attack / No Defense
+**Goal:** Mafia majority.
+**Abilities:** `!roleblock <slot>` (visit follows **Transporter**). Same **roleblock-immune** list as Escort. **Serial Killer** (aggressive): immune + may counter-kill you. **Not** blocked by **Gatekeeper** guards on Town targets.
+
 
 #### Framer
 
-- **Stats**: Faction: Mafia | Attack: None | Defense: None
-- **Command**: `!frame <slot>`
-- **Only**: Nights 1 and 2
-- **What it does**
-  - Makes targets look suspicious to Sheriff.
-  - Alters Investigator buckets (appears as Framer bucket).
-- **Tips**
-  - Frame people likely to be investigated early (quiet players, strong Town claims).
+**Faction:** Mafia
+**Stats:** No Attack / No Defense
+**Goal:** Mafia majority.
+**Abilities:** `!frame <slot>` on **Nights 1–2** only. Makes Sheriff/Investigator read suspicious.
 
-#### Gravedigger
-
-- **Stats**: Faction: Mafia | Attack: None | Defense: None
-- **Command**: `!hide <slot>`
-- **Uses**: 1
-- **Effect**: hides role on death; corpse becomes unusable for Retributionist
-- **Tips**
-  - Hiding a Town power role corpse denies info and denies Retributionist value at the same time.
-
-#### Hypnotist
-
-- **Stats**: Faction: Mafia | Attack: None | Defense: None
-- **Command**: `!hypnotize <slot> <type>`
-- **Types**: `healed`, `roleblocked`, `transported`, `controlled`, `attacked`
-- **How to use it well**
-  - Fake “attacked” to bait protection claims.
-  - Fake “roleblocked” to justify missing actions.
-  - Fake “controlled” to cause mislynches and sow confusion.
-
-#### Mole
-
-- **Stats**: Faction: Mafia | Attack: None | Defense: None
-- **Command**: `!investigate <slot>`
-- **Uses**: 1
-- **Result**: exact role (with douse/arsonist override to “Arsonist”)
-- **Tips**
-  - Use it to break a pivotal claim (Mayor/Doctor/Transporter) or to find the last Town power.
-
-#### Tailor
-
-- **Stats**: Faction: Mafia | Attack: None | Defense: None
-- **Command**: `!tailor <slot> <fake_role>`
-- **Uses**: 1
-- **What it does**
-  - Makes the target’s revealed role appear as your chosen fake role when they die.
-- **Tips**
-  - Use to “prove” a false narrative (e.g., make a Town corpse look like a neutral/evil).
 
 #### Gatekeeper
 
-- **Stats**: Faction: Mafia | Attack: None | Defense: None
-- **Command**: `!guard <slot>`
-- **Uses**: 2
-- **Effect**: roleblocks non-mafia visitors to the guarded target
-- **Stealth**: excluded from Lookout logs
-- **Extra mechanics**
-  - Gatekeeper blocks **effective** visitors (already-roleblocked players don’t visit).
-- **Tips**
-  - Guard your kill target to block Doctors/Bodyguards/Lookouts from interfering.
+**Faction:** Mafia
+**Stats:** No Attack / No Defense
+**Goal:** Mafia majority.
+**Abilities:** **2 uses** `!guard <slot>` — **non-Mafia visitors** to that slot can be RB’d (**Consort** not GK-blocked; **Escort** is). Guard follows **Transporter**; cooldown uses the **effective** guarded player. **No** self-guard, **no** Mafia target, **no** guarding the **same** player the night **immediately after** a **successful** guard on them. **Guard counts as visiting** the guarded slot (Lookout / Scary Grandma on alert).
 
----
+
+#### Gravedigger
+
+**Faction:** Mafia
+**Stats:** No Attack / No Defense
+**Goal:** Mafia majority.
+**Abilities:** **1 use** `!hide <slot>` — if they die, Town may not see their true role.
+
+
+#### Hypnotist
+
+**Faction:** Mafia
+**Stats:** No Attack / No Defense
+**Goal:** Mafia majority.
+**Abilities:** `!hypnotize <slot> <type>` fake DM. Types: `healed`, `roleblocked`, `transported`, `controlled`, `attacked`. **Counts as visiting** that slot (Lookout / alert).
+
+
+#### Mobster
+
+**Faction:** Mafia
+**Stats:** Basic Attack / No Defense
+**Goal:** Mafia majority.
+**Abilities:** `!kill` / `/kill` `<slot>` nightly (who holds the kill varies by promotion rules).
+
+
+#### Mole
+
+**Faction:** Mafia
+**Stats:** No Attack / No Defense
+**Goal:** Mafia majority.
+**Abilities:** **1 use** `!investigate <slot>` → exact role (Arsonist/douse overrides apply).
+
+
+#### Tailor
+
+**Faction:** Mafia
+**Stats:** No Attack / No Defense
+**Goal:** Mafia majority.
+**Abilities:** **1 use** `!tailor <slot> <fake_role>` — death reveal can show fake.
+
 
 ### Neutral
 
-#### Chaos
-
-- **Stats**: Faction: Neutral (Chaotic) | Attack: None | Defense: None
-- **Command**: `!chaos <slot1> <slot2>`
-- **Uses**: 2
-- **Goal**: survive to end
-- **Important**
-  - Your effects are secret/random, so play cautiously.
-  - In this bot, Chaos secretly triggers **one non-killing effect** involving your targets, such as:
-    - **roleblock**, **transport**, **heal**, **protect**, **investigate**, **watch**, **track**, **frame**, or **hide**
-  - If Chaos triggers an info-type effect (like **investigate/watch/track**) or a feedback-type effect (like **heal/protect**), you may receive the usual DMs for that effect.
-  - A Chaos use is consumed even if the random effect ends up having no impact (for example, targeting an immune role).
-
-#### Jester
-
-- **Stats**: Faction: Neutral (Evil) | Attack: Unstoppable | Defense: None
-- **Goal**: get lynched
-- **After lynch**: `!haunt` one guilty/abstain voter (DM)
-- **Extra mechanics**
-  - `!haunt` with no slot shows the up-to-date eligible list.
-  - You can only haunt someone who voted **guilty** or **abstained**.
-- **Tips**
-  - Don’t overplay. The best Jesters look like “bad Town,” not obvious trolls.
-
-#### Executioner
-
-- **Stats**: Faction: Neutral (Evil) | Attack: None | Defense: None
-- **Goal**: get your target lynched
-- **If target dies at night**: becomes Jester
-- **Tips**
-  - Your job is one lynch. Don’t start unnecessary wars after you’ve achieved it.
-
-#### Survivor
-
-- **Stats**: Faction: Neutral (Benign) | Attack: None | Defense: Basic (vested only)
-- **Command**: `!vest`
-- **Uses**: 2
-- **If roleblocked**: vest won’t be used
-- **Extra mechanics**
-  - Vest is self-only and not redirected by Transporter/Witch.
-- **Tips**
-  - Vest on nights you expect to be targeted (after claims, late game, or when vote math makes you dangerous).
-
-#### Witch
-
-- **Stats**: Faction: Neutral (Evil) | Attack: None | Defense: Night 1 only
-- **Command**: `!control <slot1> <slot2>`
-- **Learns role**: of target1
-- **Can prevent ignite**: by forcing a douse instead
-- **Extra mechanics**
-  - If the controlled player submitted no action, Witch can still force certain roles (notably Vigilante) to act.
-  - Witch cannot retarget self-only actions like `!vest` or `!clean`.
-- **Tips**
-  - Use control to “confirm” roles, then force misplays (wasted heals, wrong kills, etc.).
-
-#### Pirate
-
-- **Stats**: Faction: Neutral (Evil) | Attack: Basic | Defense: None
-- **Command**: `!plunder <slot>`
-- **Goal**: win 2 duels (can still win even if later dead)
-- **Roleblocks target**: regardless of duel outcome (unless your target is roleblock-immune)
-- **Kills only on win**: plunder becomes a kill if you win the duel
-- **Extra mechanics**
-  - The duel is a **DM reaction mini-game** (rock/paper/scissors). Both Pirate and target get 30 seconds to choose.
-  - If either side times out (or can’t be DMed), the bot picks a random choice for them to keep the duel moving.
-  - While any Pirate duel is still running, the GM cannot `!resolve` the night.
-  - Pirate is **roleblock-immune** to normal `!roleblock` (Escort/Consort-style).
-  - However, a **Gatekeeper** guarding your target can still block your plunder as a “blocked visitor” effect.
-  - If you win but a Bodyguard counters you, you can still receive a special “you won, but died first” style message.
-- **Tips**
-  - Pick targets likely to be unprotected and not on alert.
 
 #### Arsonist
 
-- **Stats**: Faction: Neutral (Killing) | Attack: Unstoppable | Defense: Basic
-- **Commands**: `!douse <slot>`, `!ignite`, `!clean`
-- **Douse**: marks players; they get “You smell gasoline…”
-- **Ignite**: kills all currently doused living players
-- **Clean**: removes gasoline from yourself (applies after douses)
-- **Extra mechanics**
-  - `!clean` is applied after douses, so if you are both doused and cleaned the same night, clean wins.
-  - Doused players (and Arsonist) look suspicious to Sheriff and can affect Investigator buckets.
-  - If you ignite while you are doused, you burn too.
-- **Tips**
-  - Don’t ignite too early. The best ignites happen when enough people are doused to end the game or flip the vote math.
+**Faction:** Neutral (Killing)
+**Stats:** Unstoppable ignite / Basic vs normal kills
+**Goal:** Eliminate opposition.
+**Abilities:** `!douse`, `!doused` (list doused), `!ignite`, `!clean` (self). Doused + you read suspicious. **Ignite** is Unstoppable (pierces heal/Basic/Powerful); **GA invincible ward** still blocks.
 
----
 
-## FAQ
+#### Chaos
 
-### Do I need DMs enabled?
+**Faction:** Neutral (Chaotic)
+**Stats:** No Attack / **N1 Defense** (first **Basic-tier** night kill only; not ignite)
+**Goal:** Be **alive** at endgame — you win with **whoever wins** (Town, Mafia, Arsonist, Serial Killer, etc.).
+**Abilities:** **2** `!chaos <s1> <s2>` — **two other players** (not self). One **secret** random non-kill: **RB, transport, investigate, watch, track, frame, hide, guard** (GK-style on first slot). If you **roleblock** an aggressive **Serial Killer**, you can be **counter-killed** (same as Escort/Consort). You may get investigate/watch/track DMs; effect name is **not** told. Use spent even if no-op / you’re RB’d before resolve.
+**Notes:** **Control-immune**. **Not** roleblock-immune.
 
-No. DMs are optional — you can submit actions in your private channel.
 
-### Why doesn’t `/heal` work in DMs?
+#### Executioner
 
-Slash commands are guild-scoped. Use prefix commands in DMs.
+**Faction:** Neutral (Evil)
+**Stats:** No Attack / Basic Defense
+**Goal:** Get your assigned **Town** (non-Mayor) target **lynched** while you’re alive.
+**Abilities:** Target **lynched** → you **win** (stay Executioner). Target dies **non-lynch** → you become **Jester**.
 
-### My night command didn’t work
 
-Most common reasons:
+#### Guardian Angel
 
-- it’s not night, or night is resolving
-- you’re dead
-- you used the command in a public channel (privacy rejection)
-- you don’t have the role for that command
+**Faction:** Neutral (Benign)
+**Stats:** No Attack / No Defense (`!ward` grants **invincible** defense on bind that night only)
+**Goal:** You and your bound player must survive and your bind must achieve their win; a stalemate override can also qualify. A dead GA may still ward but does not win.
+**Abilities:** Start bound to one other player (DM), including neutrals. **1×** `!ward <bind slot>` — clears their douse, **invincible** ward that night (blocks kills and ignite), locks **nominations** on them next day if they would be on trial, public dawn line. **Living** ward is a physical visit; **dead GA** ward is **astral** (no Lookout/GK/SG alert). Defeated if bind dies (except protected lynch day) or bind is haunt-killed.
 
-### Do night actions “visit” people?
 
-Yes. The bot tracks visits for Lookout/Tracker/Alert-style effects. Some actions are treated specially:
+#### Jester
 
-- **Gatekeeper** is excluded from visit logs on purpose (you won’t see them as a visitor).
-- **Transport** and **Control** are multi-target and handled specially.
+**Faction:** Neutral (Evil)
+**Stats:** No Attack / **N1 Defense** (first **Basic-tier** kill on **Night 1** only; not ignite)
+**Goal:** Be **lynched**.
+**Abilities:** After lynch win → `!haunt` a **guilty** or **abstain** voter. Haunt is applied as a **night death** at resolve (not a normal kill shot, so no heal/BG-style save path).
+**Notes:** N1 shield is for **lobby Jesters**. **EXE→Jester** after Night 1 effectively has **no** shield (rare early-N1 conversion can still match the engine window).
 
-### What happens if I’m roleblocked?
 
-- Your action won’t go through, and you’ll typically get a DM telling you that you were roleblocked.
-- Some roles are **roleblock-immune** in this bot (see the “Immunities” section above).
+#### Pirate
 
-### Can Transporter mess up my action?
+**Faction:** Neutral (Evil)
+**Stats:** Powerful Attack (on duel win) / No Defense
+**Goal:** **2** duel wins that **also kill** (plunder kill must land).
+**Abilities:** `!plunder <slot>` — RPS duel; RB target win or lose; **Powerful** kill only on **win**. **Roleblock-immune**; Gatekeeper on target can still block you as a visitor.
 
-Yes. Transport can redirect many targeted actions (kills, heals, investigations, blocks). Some self-only/special actions aren’t redirected (vest/clean, pirate actions, transport itself).
 
-### Can Doctor save someone from ignite?
+#### Serial Killer
 
-No. Ignite is an unstoppable mass-kill and burns through defenses like heals/alert.
+**Faction:** Neutral (Killing)
+**Stats:** Basic Attack / Basic Defense vs normal kills
+**Goal:** Last killer standing.
+**Abilities:** `!stab <slot>` nightly (not the Mafia `!kill`). `!cautious` toggles **Aggressive** (counter Escort/Consort who roleblock you) vs **Cautious**. Immune to roleblock; Pirate duel interactions apply.
 
-### When does Vigilante guilt trigger?
 
-Only if your shot actually **kills** a Town member. If your shot fails due to defense/heal, guilt does not trigger from that shot.
+#### Survivor
 
-### Why did Sheriff say “suspicious” on a Town player?
+**Faction:** Neutral (Benign)
+**Stats:** No Attack / Basic while vested
+**Goal:** Be **alive** at endgame — you win with **whoever wins** (Town, Mafia, Arsonist, Serial Killer, etc.).
+**Abilities:** **2** `!vest` — blocked = vest not consumed. Vest is **self**-only (not Witch-retargetable).
 
-Because **framing** and **dousing** can both cause Town players to appear suspicious.
 
-### What happens if my Executioner target dies at night?
+#### Witch
 
-You become **Jester**.
+**Faction:** Neutral (Evil)
+**Stats:** No Attack / **N1 Defense** (first **Basic-tier** kill; not ignite)
+**Goal:** Be **alive** when **Town loses** — you joint-win with **Mafia**, **Arsonist**, or **Serial Killer** (not on a **Town** win; unlike **Survivor**, who wins with any side).
+**Abilities:** `!control <victim> <newTarget>` — learn victim’s role; redirect their action when rules allow. Cannot retarget self-only actions (`vest`, `clean`).
+**Notes:** **Roleblock-immune** and **control-immune**.
 
-### Can I still win as Pirate if I die later?
 
-Yes — if you reached 2 duel wins, you can still count as a winner even if you later die.
+## Questions and interaction rules
+
+**Does accepting an action guarantee it will work?** No. Transport, control, roleblock, protection, and simultaneous deaths can change its effect. The ordered engine determines the final result.
+
+**What counts as a visit?** Ordinary targeted actions visit their effective destinations. Gatekeeper guards and Hypnotist actions count as visits. Self-only vest, alert, Bodyguard vest, and clean do not visit another house. Transport/control have special visit rules. A dead Guardian Angel wards astrally and does not appear as a visitor.
+
+**Can a Doctor stop ignite?** No: Doctor healing grants powerful defense, while ignite is unstoppable. Guardian Angel's invincible ward can stop ignite and also clears the bind's douse.
+
+**When does Vigilante guilt apply?** Only after actually killing Town. A failed attack does not trigger guilt. The resulting death is deferred to the following night. A mistaken Deputy shot is different: the Deputy dies as part of the daytime shot.
+
+**Can I use a Transporter corpse?** Yes. The modern controls accept two distinct living targets and the shared corpse-expansion code creates a real transport action. Eligible corpse types are Doctor, Sheriff, Investigator, Lookout, Tracker, Escort, Bodyguard, Vigilante, and Transporter. A hidden or already-used corpse is unavailable; Psychic, Deputy, Seer, Mayor, Scary Grandma, and Retributionist are not usable corpse types.
+
+**Can a dead player act?** Normally no. A successfully lynched Jester may haunt an eligible guilty/abstaining voter. A Guardian Angel can use a remaining ward from the grave while the bound player remains eligible, but a dead Guardian Angel does not receive a personal win.
+
+**What does a Pirate win mean?** Two successful duel choices are insufficient if the kills are prevented. The personal objective counts effective plunder kills; achieving it can remain recorded after Pirate dies.
+
+**What survives a restart?** Modern panels can be reopened, persisted duels/trials can resume, and committed night results can finish pending delivery. The bot repairs relevant permissions. Legacy control records have more limited recovery, and Discord sends can repeat if a crash happens between delivery and local acknowledgement.
+
+**Why can an innocent player look suspicious?** Frames and douses affect investigative readings. Tailor changes a death reveal; the engine keeps the underlying role separately. Seer uses alignment buckets rather than exact role identification.
+
+For installation, source layout, testing, and simulator assumptions, see the [README](README.md) and [simulation guide](docs/SIMULATION.md).

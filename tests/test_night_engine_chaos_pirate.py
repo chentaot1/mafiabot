@@ -27,17 +27,8 @@ class _FakeGuild:
         return self._members.get(int(uid))
 
 
-EFF_POOL = [
-    "roleblock",
-    "transport",
-    "heal",
-    "protect",
-    "investigate",
-    "watch",
-    "track",
-    "frame",
-    "hide",
-]
+from config import CHAOS_EFFECT_POOL
+EFF_POOL = CHAOS_EFFECT_POOL
 
 
 def _eff_for(game: game_module.Game, actor_id: int, t1: int, t2: int) -> str:
@@ -97,7 +88,7 @@ def test_pirate_plunder_win_idempotent_per_night() -> None:
     assert g.role_states[1].get("pirate_win_this_night") is True
 
 
-def test_chaos_protect_causes_chaos_to_die_on_successful_guard() -> None:
+def test_chaos_guard_blocks_the_attack_without_sacrificing_chaos() -> None:
     from engine.night import run_night_pipeline
 
     # 1=Chaos, 2=Survivor (victim), 3=Vigilante (attacker). Add extra living slots to make
@@ -106,7 +97,7 @@ def test_chaos_protect_causes_chaos_to_die_on_successful_guard() -> None:
     m1, m2, m3 = _FakeMember(1), _FakeMember(2), _FakeMember(3)
     members = [m1, m2, m3] + extras
     roles: dict[int, str] = {1: "Chaos", 2: "Survivor", 3: "Vigilante"}
-    states: dict[int, dict] = {1: {"uses_remaining": 2}, 2: {"vests_remaining": 2}, 3: {}}
+    states: dict[int, dict] = {1: {"uses_remaining": 2}, 2: {"vests_remaining": 2}, 3: {"shots_remaining": 1}}
     for em in extras:
         roles[em.id] = "Survivor"
         states[em.id] = {"vests_remaining": 2}
@@ -114,7 +105,7 @@ def test_chaos_protect_causes_chaos_to_die_on_successful_guard() -> None:
     g = _mk_game(members, roles=roles, role_states=states)
     # Find any target pair that deterministically yields protect, then attack that protected target (t1).
     living_ids = [m.id for m in members if m.id != 1]
-    t1, t2 = _find_pair_for_eff(g, actor_id=1, living_ids=living_ids, desired="protect")
+    t1, t2 = _find_pair_for_eff(g, actor_id=1, living_ids=living_ids, desired="guard")
 
     # Ensure the protected target is the intended kill victim (t1 becomes chaos_protected_by target).
     g.night_actions = {
@@ -125,7 +116,10 @@ def test_chaos_protect_causes_chaos_to_die_on_successful_guard() -> None:
     _visit_log, _blocked, _healed_by, _protected_by, deaths = asyncio.run(run_night_pipeline(g, _FakeGuild(g.players)))  # type: ignore[arg-type]
 
     # If the guard triggers (i.e., target was attacked), Chaos dies (Bodyguard-style).
-    assert 1 in deaths, "Expected Chaos to die on successful Chaos-protect guard"
+    assert 1 not in deaths
+    assert t1 not in deaths
+    assert 3 in _blocked
+    assert g.role_states[1]["uses_remaining"] == 1
 
 
 def test_chaos_roleblock_injected_as_real_action() -> None:

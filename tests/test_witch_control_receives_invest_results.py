@@ -169,8 +169,8 @@ def test_witch_receives_controlled_lookout_visitors_message() -> None:
     lo_msgs = "\n".join(lookout.messages).lower()
     witch_msgs = "\n".join(witch.messages).lower()
 
-    assert "visited your target" in lo_msgs or "nobody visited your target" in lo_msgs
-    assert "visited your target" in witch_msgs or "nobody visited your target" in witch_msgs
+    assert "your target was visited by" in lo_msgs or "nobody visited your target" in lo_msgs
+    assert "your target was visited by" in witch_msgs or "nobody visited your target" in witch_msgs
 
 
 def test_witch_does_not_receive_results_if_controlled_target_had_no_action() -> None:
@@ -220,7 +220,7 @@ def test_witch_does_not_receive_results_if_controlled_target_had_no_action() -> 
 
     witch_msgs = "\n".join(witch.messages).lower()
     # Witch always learns the role of controlled target.
-    assert "learned the role" in witch_msgs
+    assert "they must be a sheriff" in witch_msgs
     # But there should be no mirrored investigative result.
     assert "suspicious" not in witch_msgs
     assert "innocent" not in witch_msgs
