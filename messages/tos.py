@@ -445,7 +445,7 @@ def psychic_too_evil() -> str:
 
 
 def retri_corpse_missing() -> str:
-    return "The corpse you targeted is missing!"
+    return "The selected corpse or target is no longer usable. Your reanimation did not resolve, and no use was spent."
 
 
 def gatekeeper_turned_away() -> str:

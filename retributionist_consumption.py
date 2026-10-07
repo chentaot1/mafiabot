@@ -15,7 +15,7 @@ def consume_retributionist_uses(
     healed_by: Union[HealedByMap, Dict[int, int]],
 ) -> None:
     """
-    Decrement Retributionist uses for each submitted corpse action (``_from_retri``).
+    Decrement Retributionist uses for each valid corpse action (``_from_retri``).
 
     Consumption does not depend on whether heal, shoot, roleblock, etc. succeeded.
     Mirrors live ``!resolve`` and Monte Carlo ``resolve_night_via_engine``.
@@ -25,12 +25,15 @@ def consume_retributionist_uses(
     """
     del blocked, healed_by
 
-    from reanimate_expand import expand_reanimate_actions
+    from reanimate_expand import expand_reanimate_actions, normalized_retributionist_action
 
-    expand_reanimate_actions(game)
+    expand_reanimate_actions(game, for_execution=False)
 
     for actor_id, action in list(game.night_actions.items()):
         if game.player_roles.get(actor_id) != "Retributionist":
+            continue
+        action = normalized_retributionist_action(game, actor_id, action)
+        if action is None:
             continue
 
         corpse_pid = action.get("_from_retri")

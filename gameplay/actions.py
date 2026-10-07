@@ -47,6 +47,10 @@ HYPNOTIST_MESSAGES = ("healed", "roleblocked", "transported", "controlled", "att
 from reanimate_expand import RETRI_CORPSE_EXPANDABLE_ROLES as CORPSE_ROLES
 
 
+def ability_label(ability):
+    return {'sk_kill': 'Stab', 'gaze': 'Compare pair', 'cautious': 'Change mode'}.get(ability, ability.title())
+
+
 @dataclass(frozen=True)
 class Submission:
     accepted: bool
@@ -74,8 +78,29 @@ def abilities_for(game, actor_id: int) -> list[str]:
             and (key != 'protect' or state.get('uses_remaining',0)>0 or state.get('self_protects_remaining',0)>0)]
 
 
+def seer_pair_used(game, actor_id, first, second):
+    history = game.role_states.get(actor_id, {}).get('seer_pair_history', [])
+    if not isinstance(history, list):
+        return False
+    for pair in history:
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            continue
+        try:
+            if sorted((int(pair[0]), int(pair[1]))) == sorted((first, second)):
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def seer_targets(game, actor_id, partner=None):
+    return [p for p in game.ordered_living_players() if p.id != actor_id and p.id != partner
+            and not (game.player_roles.get(p.id) == 'Mayor' and game.role_states.get(p.id, {}).get('is_revealed'))
+            and (partner is None or not seer_pair_used(game, actor_id, partner, p.id))]
+
+
 def build_action(game, actor_id: int, ability: str, targets=(), *, corpse_id=None,
-                 message_type=None, fake_role=None) -> dict:
+                 message_type=None, fake_role=None, cautious_mode=None) -> dict:
     """Pure validation/payload factory. Commands and components use this exact path."""
     spec = ABILITIES.get(ability)
     role = game.player_roles.get(actor_id)
@@ -127,7 +152,7 @@ def build_action(game, actor_id: int, ability: str, targets=(), *, corpse_id=Non
     if ability == 'gaze':
         if any(game.player_roles.get(t) == 'Mayor' and game.role_states.get(t, {}).get('is_revealed') for t in targets):
             raise Rejected('You cannot gaze a revealed Mayor.')
-        if sorted(targets) in [sorted(pair) for pair in state.get('seer_pair_history', [])]:
+        if seer_pair_used(game, actor_id, *targets):
             raise Rejected('You have already gazed this pair.')
     if not spec.allow_self and actor_id in targets:
         raise Rejected("You cannot target yourself.")
@@ -139,6 +164,10 @@ def build_action(game, actor_id: int, ability: str, targets=(), *, corpse_id=Non
         if ability == "heal" and targets[0] == actor_id and state.get("self_heals_remaining", 0) <= 0:
             raise Rejected("You have already used your self-heal!")
     action = {"type": ability, "actor": actor_id}
+    if ability == 'cautious' and cautious_mode is not None:
+        if not isinstance(cautious_mode, bool):
+            raise Rejected('Choose Cautious or Aggressive.')
+        action['cautious_mode'] = cautious_mode
     if required == 2:
         action["targets"] = list(targets)
     elif required:
@@ -193,15 +222,17 @@ async def submit(game, actor_id: int, ability: str, targets=(), *, expected=None
             game.role_states[actor_id].update(haunt_target=action["target"], can_haunt=False)
         elif ability == 'cautious':
             state = game.role_states.setdefault(actor_id, {})
-            state['sk_cautious'] = not bool(state.get('sk_cautious'))
+            state['sk_cautious'] = action.get('cautious_mode', not bool(state.get('sk_cautious')))
             return Submission(True, 'You are now ' + ('Cautious.' if state['sk_cautious'] else 'Aggressive.'), action)
         else:
             game.night_actions[actor_id] = action
             if ability == 'sk_kill':
                 game.role_states.setdefault(actor_id, {})['sk_target_id'] = action['target']
+            if ability == 'gaze':
+                game.role_states.setdefault(actor_id, {})['seer_submitted_targets'] = list(action['targets'])
         if cooldown:
             game.action_cooldowns[key] = time.monotonic() + 2
-        return Submission(True, f"Saved **{ability}** for tonight." +
+        return Submission(True, f"Saved **{ability_label(ability)}** for tonight." +
                           (" Your previous action was replaced." if existing else ""), action)
     try:
         result = await commit(game, update)

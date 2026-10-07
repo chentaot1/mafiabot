@@ -1856,6 +1856,21 @@ def check_gatekeeper_guard_use_is_idempotent_within_same_night() -> None:
 
 
 
+def _smoke_owned_game(game):
+    """Give headless phase checks the same canonical ownership as live commands."""
+    from contextlib import contextmanager
+    import game as gm
+    @contextmanager
+    def scope():
+        games, client = gm.active_games, gm._BOT
+        gm.active_games, gm._BOT = {game.guild_id: game}, None
+        try:
+            yield
+        finally:
+            gm.active_games, gm._BOT = games, client
+    return scope()
+
+
 def check_start_night_clears_gatekeeper_used_marker() -> None:
     # Downstream check: the per-night marker must be cleared at the start of the next night.
     import game as game_module
@@ -1881,7 +1896,8 @@ def check_start_night_clears_gatekeeper_used_marker() -> None:
 
     import asyncio
 
-    asyncio.run(g.start_night(_Ctx()))
+    with _smoke_owned_game(g):
+        asyncio.run(g.start_night(_Ctx()))
     assert "gatekeeper_used_this_night" not in g.role_states[1], "Expected start_night to clear gatekeeper marker"
 
 
@@ -2793,6 +2809,7 @@ def check_roles_text_witch_wincon_matches_implementation() -> None:
 def check_setup_infrastructure_is_idempotent_and_hardens_privacy() -> None:
     # Infrastructure invariant: setup_infrastructure() should be idempotent and enforce private-channel privacy overwrites.
     import asyncio
+    import discord
 
     import game as game_module
     from config import (
@@ -2823,7 +2840,10 @@ def check_setup_infrastructure_is_idempotent_and_hardens_privacy() -> None:
         async def set_permissions(self, role, **perms):
             # record and store an overwrite dict-like payload for assertions
             self._set_calls.append((int(getattr(role, "id", -1)), dict(perms)))
-            self.overwrites[role] = dict(perms)
+            self.overwrites[role] = discord.PermissionOverwrite(**perms)
+
+        async def edit(self, *, overwrites, reason=None):
+            self.overwrites = dict(overwrites)
 
     class _Category(_Chan):
         pass
@@ -2835,6 +2855,7 @@ def check_setup_infrastructure_is_idempotent_and_hardens_privacy() -> None:
             self.channels: list[_Chan] = []
             self.categories: list[_Category] = []
             self.default_role = _Role(1, "@everyone")
+            self.me = _Role(999, 'Bot')
             self.roles.append(self.default_role)
 
             # Pre-existing roles expected by setup_infrastructure
@@ -2882,7 +2903,8 @@ def check_setup_infrastructure_is_idempotent_and_hardens_privacy() -> None:
     guild = _Guild()
     g = game_module.Game(guild_id=123)
 
-    asyncio.run(g.setup_infrastructure(guild))  # type: ignore[arg-type]
+    with _smoke_owned_game(g):
+        asyncio.run(g.setup_infrastructure(guild))  # type: ignore[arg-type]
     first_channel_count = len(guild.channels)
     first_role_count = len(guild.roles)
 
@@ -2892,7 +2914,11 @@ def check_setup_infrastructure_is_idempotent_and_hardens_privacy() -> None:
     assert g.day_vc_id is not None and g.grave_vc_id is not None
 
     # Re-run should not create duplicates.
-    asyncio.run(g.setup_infrastructure(guild))  # type: ignore[arg-type]
+    stale = _Role(998, 'Former player or obsolete role')
+    for ch in guild.channels:
+        ch.overwrites[stale] = discord.PermissionOverwrite(view_channel=True)
+    with _smoke_owned_game(g):
+        asyncio.run(g.setup_infrastructure(guild))  # type: ignore[arg-type]
     assert len(guild.channels) == first_channel_count, "Expected setup_infrastructure to be idempotent for channels"
     assert len(guild.roles) == first_role_count, "Expected setup_infrastructure to be idempotent for roles"
 
@@ -2906,20 +2932,22 @@ def check_setup_infrastructure_is_idempotent_and_hardens_privacy() -> None:
     for private_name in [MAFIA_CHANNEL_NAME, GRAVEYARD_TEXT_CHANNEL_NAME, GRAVEYARD_VOICE_CHANNEL_NAME]:
         ch = by_name.get(private_name)
         assert ch is not None, f"Expected channel {private_name}"
-        # Our stub stores overwrites as dicts set via set_permissions.
-        assert ch.overwrites.get(guild.default_role, {}).get("view_channel") is False, f"{private_name} must hide @everyone"
-        assert ch.overwrites.get(alive_role, {}).get("view_channel") is False, f"{private_name} must hide Alive"
-        assert ch.overwrites.get(playing_role, {}).get("view_channel") is False, f"{private_name} must hide Playing"
+        assert ch.overwrites[guild.default_role].view_channel is False, f"{private_name} must hide @everyone"
+        assert ch.overwrites[alive_role].view_channel is False, f"{private_name} must hide Alive"
+        assert ch.overwrites[playing_role].view_channel is False, f"{private_name} must hide Playing"
+        assert ch.overwrites[guild.me].view_channel is True, f"{private_name} must permit the bot"
+        assert ch.overwrites[guild.me].read_message_history is True
+        assert stale not in ch.overwrites, f"{private_name} must remove stale access"
 
     # Day VC permissions: @everyone no connect/speak, Alive can connect/speak, Stand can connect/speak.
     day_vc = by_name.get(DAY_VOICE_CHANNEL_NAME)
     assert day_vc is not None
-    assert day_vc.overwrites.get(guild.default_role, {}).get("connect") is False
-    assert day_vc.overwrites.get(guild.default_role, {}).get("speak") is False
-    assert day_vc.overwrites.get(alive_role, {}).get("connect") is True
-    assert day_vc.overwrites.get(alive_role, {}).get("speak") is True
-    assert day_vc.overwrites.get(stand_role, {}).get("connect") is True
-    assert day_vc.overwrites.get(stand_role, {}).get("speak") is True
+    assert day_vc.overwrites[guild.default_role].connect is False
+    assert day_vc.overwrites[guild.default_role].speak is False
+    assert day_vc.overwrites[alive_role].connect is True
+    assert day_vc.overwrites[alive_role].speak is True
+    assert day_vc.overwrites[stand_role].connect is True
+    assert day_vc.overwrites[stand_role].speak is True
 
     # Day text channel exists (spectator-visible, but not asserted here).
     assert DAY_TEXT_CHANNEL_NAME in by_name
@@ -2953,6 +2981,9 @@ def check_setup_infrastructure_partial_existing_channels_are_reused() -> None:
             self.category = category
             self.overwrites = overwrites or {}
 
+        async def edit(self, *, overwrites, reason=None):
+            self.overwrites = dict(overwrites)
+
         async def set_permissions(self, *_args, **_kwargs):
             return
 
@@ -2964,6 +2995,7 @@ def check_setup_infrastructure_partial_existing_channels_are_reused() -> None:
             self._next_id = 2000
             self.roles = [_Role(1, "@everyone")]
             self.default_role = self.roles[0]
+            self.me = _Role(999, "Bot")
             self.categories: list[_Category] = []
             self.channels: list[_Chan] = []
             # Pre-existing roles expected by setup_infrastructure
@@ -3013,7 +3045,8 @@ def check_setup_infrastructure_partial_existing_channels_are_reused() -> None:
     existing_mafia = asyncio.run(guild.create_text_channel(MAFIA_CHANNEL_NAME))
 
     g = game_module.Game(guild_id=123)
-    asyncio.run(g.setup_infrastructure(guild))  # type: ignore[arg-type]
+    with _smoke_owned_game(g):
+        asyncio.run(g.setup_infrastructure(guild))  # type: ignore[arg-type]
     by_name = {c.name: c for c in guild.channels}
 
     # Existing channels are reused (same ids).
@@ -3054,6 +3087,9 @@ def check_setup_infrastructure_lockdown_role_hides_other_categories_and_records_
             self.category = category
             self.overwrites = overwrites or {}
 
+        async def edit(self, *, overwrites, reason=None):
+            self.overwrites = dict(overwrites)
+
         async def set_permissions(self, *_args, **_kwargs):
             return
 
@@ -3062,6 +3098,7 @@ def check_setup_infrastructure_lockdown_role_hides_other_categories_and_records_
             self._next_id = 3000
             self.roles = [_Role(1, "@everyone")]
             self.default_role = self.roles[0]
+            self.me = _Role(999, "Bot")
             self.channels: list[_Chan] = []
             self.categories: list[_Category] = []
             self._roles_by_id = {
@@ -3112,7 +3149,8 @@ def check_setup_infrastructure_lockdown_role_hides_other_categories_and_records_
 
     guild = _Guild()
     g = game_module.Game(guild_id=123)
-    asyncio.run(g.setup_infrastructure(guild))  # type: ignore[arg-type]
+    with _smoke_owned_game(g):
+        asyncio.run(g.setup_infrastructure(guild))  # type: ignore[arg-type]
 
     # Should lock all categories except the Mafia Game category.
     locked = set(getattr(g, "locked_channel_ids", []) or [])
@@ -3281,9 +3319,11 @@ def check_start_day_is_idempotent_within_same_day() -> None:
     g.day_number = 1
     g.players = []
     g.living_players = []
-    asyncio.run(g.start_day(ctx))
+    with _smoke_owned_game(g):
+        asyncio.run(g.start_day(ctx))
     d1 = g.day_number
-    asyncio.run(g.start_day(ctx))
+    with _smoke_owned_game(g):
+        asyncio.run(g.start_day(ctx))
     assert g.day_number == d1, f"Expected start_day to be idempotent, got {d1} -> {g.day_number}"
 
 
@@ -3330,13 +3370,15 @@ def check_start_night_is_idempotent_within_same_night() -> None:
     g.day_number = 1
     g.role_states = {1: {"is_vested": True}}
     g.night_actions = {}
-    asyncio.run(g.start_night(ctx))
+    with _smoke_owned_game(g):
+        asyncio.run(g.start_night(ctx))
     # First call should enter night and clear one-night flags.
     assert g.phase == "night"
     assert "is_vested" not in g.role_states.get(1, {})
     # Second call should not change anything further (idempotent).
     before = (g.day_number, dict(g.role_states.get(1, {})), dict(g.night_actions))
-    asyncio.run(g.start_night(ctx))
+    with _smoke_owned_game(g):
+        asyncio.run(g.start_night(ctx))
     after = (g.day_number, dict(g.role_states.get(1, {})), dict(g.night_actions))
     assert before == after, "Expected start_night to be idempotent within same night"
 
@@ -3371,7 +3413,8 @@ def check_start_night_does_not_wipe_actions_if_already_night() -> None:
     g.living_players = []
     g.night_actions = {1: {"type": "vest", "actor": 1, "target": 1}}
     ctx = _Ctx()
-    asyncio.run(g.start_night(ctx))
+    with _smoke_owned_game(g):
+        asyncio.run(g.start_night(ctx))
     assert g.night_actions.get(1, {}).get("type") == "vest", "Expected start_night not to wipe actions if already night"
 
 
@@ -3465,12 +3508,9 @@ def check_db_init_migration_does_not_drop_tables() -> None:
 
 
 def check_private_channels_are_hidden_from_everyone_and_playing() -> None:
-    # Security/privacy invariant: mafia/graveyard channels should be hidden from @everyone and Playing role.
-    src = GAME_PY.read_text(encoding="utf-8")
-    # Evidence: setup_infrastructure sets @everyone view_channel False.
-    assert "await ch.set_permissions(guild.default_role, view_channel=False)" in src, "Expected private channels hidden from @everyone"
-    # Evidence: playing_role is explicitly hidden from mafia/graveyard channels.
-    assert "await ch.set_permissions(playing_role, view_channel=False)" in src, "Expected private channels hidden from Playing role"
+    # Verify overwrite values and removal of stale grants instead of requiring
+    # the obsolete sequence of individual set_permissions calls.
+    check_setup_infrastructure_is_idempotent_and_hardens_privacy()
 
 
 
@@ -4430,7 +4470,8 @@ def check_leaderboard_slash_and_db_init_exist() -> None:
                 has_db_init_call = True
 
     assert has_db_assign, "Expected on_ready to assign bot.db = Database(...)"
-    assert has_db_init_call, "Expected on_ready to call bot.db.initialize()"
+    has_db_init_call |= 'await run_blocking(bot.db.initialize)' in (ast.get_source_segment(src, on_ready) or '')
+    assert has_db_init_call, "Expected on_ready to initialize the database directly or through the worker boundary"
 
 
 

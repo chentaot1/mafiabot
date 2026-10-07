@@ -2,6 +2,9 @@
 .env.*
 !.env.example
 .venv/
+.venv314/
+.venv312-check/
+.runtimes/
 venv/
 __pycache__/
 *.py[cod]
@@ -22,3 +25,9 @@ test-results.xml
 .cursor/
 .DS_Store
 Thumbs.db
+
+# Local editor settings and generated review exports
+*.code-workspace
+/python
+/docs/AUDIT_FIXES.md
+/docs/audit-fixes.patch

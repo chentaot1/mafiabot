@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from dataclasses import dataclass
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
@@ -45,17 +46,30 @@ class Database:
     def __init__(self, path: str) -> None:
         self.path = path
 
+    @contextmanager
+    def _transaction(self):
+        conn = self._conn()
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
     def _conn(self) -> sqlite3.Connection:
         _ensure_parent_dir(self.path)
         # timeout avoids transient "database is locked" failures on Windows/slow disks
         conn = sqlite3.connect(self.path, timeout=30)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA foreign_keys = ON")
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA foreign_keys = ON")
+        except BaseException:
+            conn.close()
+            raise
         return conn
 
     def initialize(self) -> None:
-        with self._conn() as conn:
+        with self._transaction() as conn:
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS games (
@@ -145,7 +159,7 @@ class Database:
                         continue
                     raise
 
-        with self._conn() as conn:
+        with self._transaction() as conn:
             conn.executescript(
                 """
                 CREATE INDEX IF NOT EXISTS idx_games_guild_ended ON games(guild_id, ended_at);
@@ -160,6 +174,7 @@ class Database:
                     guild_id INTEGER NOT NULL,
                     kind TEXT NOT NULL,
                     dedupe_key TEXT,
+                    match_key TEXT,
                     target_user_id INTEGER NOT NULL,
                     content TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'pending',
@@ -184,6 +199,10 @@ class Database:
                 """
             )
 
+            columns = {row[1] for row in conn.execute('PRAGMA table_info(dm_outbox)')}
+            if 'match_key' not in columns:
+                conn.execute('ALTER TABLE dm_outbox ADD COLUMN match_key TEXT')
+
     # --------------------
     # Write helpers
     # --------------------
@@ -204,7 +223,7 @@ class Database:
 
         Returns (is_first_insert, game_id).
         """
-        with self._conn() as conn:
+        with self._transaction() as conn:
             cur = conn.execute(
                 """
                 INSERT OR IGNORE INTO games(
@@ -230,7 +249,7 @@ class Database:
 
     def has_game_key(self, game_key: str) -> bool:
         """True if this endgame was already committed to SQLite (idempotent retry)."""
-        with self._conn() as conn:
+        with self._transaction() as conn:
             row = conn.execute(
                 "SELECT 1 FROM games WHERE game_key=? LIMIT 1",
                 (str(game_key),),
@@ -244,7 +263,7 @@ class Database:
         guild_id: int,
         rows: Iterable[dict],
     ) -> None:
-        with self._conn() as conn:
+        with self._transaction() as conn:
             conn.executemany(
                 """
                 INSERT OR IGNORE INTO game_players(
@@ -285,7 +304,7 @@ class Database:
         wins_arsonist: int,
         last_game_at: Optional[str] = None,
     ) -> None:
-        with self._conn() as conn:
+        with self._transaction() as conn:
             conn.execute(
                 """
                 INSERT INTO player_stats(
@@ -328,7 +347,7 @@ class Database:
         wins_total: int,
         losses_total: int,
     ) -> None:
-        with self._conn() as conn:
+        with self._transaction() as conn:
             conn.execute(
                 """
                 INSERT INTO player_role_stats(
@@ -344,7 +363,7 @@ class Database:
             )
 
     def upsert_personal_win_delta(self, *, guild_id: int, player_id: int, key: str, delta: int) -> None:
-        with self._conn() as conn:
+        with self._transaction() as conn:
             conn.execute(
                 """
                 INSERT INTO player_personal_stats(guild_id, player_id, key, count)
@@ -389,7 +408,7 @@ class Database:
         method would normally take (without the ``guild_id``, which is
         passed once at the top level).
         """
-        with self._conn() as conn:
+        with self._transaction() as conn:
             # games row — INSERT OR IGNORE then SELECT to get id; if a
             # prior commit already inserted the row, return early.
             cur = conn.execute(
@@ -539,7 +558,7 @@ class Database:
             personal_wins: {Key: count},
           }
         """
-        with self._conn() as conn:
+        with self._transaction() as conn:
             st = conn.execute(
                 """
                 SELECT
@@ -619,7 +638,7 @@ class Database:
     def build_json_players_mirror(self, *, guild_id: int) -> Dict[str, Dict]:
         """Rebuild JSON ``players`` dict from SQLite (canonical aggregates)."""
         gid = int(guild_id)
-        with self._conn() as conn:
+        with self._transaction() as conn:
             stat_rows = conn.execute(
                 """
                 SELECT player_id,
@@ -703,7 +722,7 @@ class Database:
     def top_total_wins(self, *, guild_id: int, limit: int = 10) -> list[LeaderboardRow]:
         # Audit H3 — write paths clamp negatives via MAX(..., 0); read paths
         # must clamp too so leaderboards never surface negative counts.
-        with self._conn() as conn:
+        with self._transaction() as conn:
             rows = conn.execute(
                 """
                 SELECT player_id,
@@ -725,7 +744,7 @@ class Database:
         if not col:
             raise ValueError(f"Unsupported faction: {faction}")
         # Audit H3 — clamp on read.
-        with self._conn() as conn:
+        with self._transaction() as conn:
             rows = conn.execute(
                 f"""
                 SELECT player_id,
@@ -750,7 +769,7 @@ class Database:
         if str(key) == "guardian_angel_win":
             keys.append("guardian_angel_joint")
         placeholders = ",".join("?" for _ in keys)
-        with self._conn() as conn:
+        with self._transaction() as conn:
             rows = conn.execute(
                 f"""
                 SELECT
@@ -774,7 +793,7 @@ class Database:
 
     def top_winrate(self, *, guild_id: int, min_games: int = 5, limit: int = 10) -> list[LeaderboardRow]:
         # Audit H3 — clamp wins and games on read; winrate uses clamped values.
-        with self._conn() as conn:
+        with self._transaction() as conn:
             rows = conn.execute(
                 """
                 SELECT player_id,
@@ -805,7 +824,7 @@ class Database:
         return "Neutral"
 
     def get_guild_stats_board(self, *, guild_id: int) -> Optional[dict]:
-        with self._conn() as conn:
+        with self._transaction() as conn:
             row = conn.execute(
                 """
                 SELECT guild_id, channel_id, message_id, updated_at
@@ -831,7 +850,7 @@ class Database:
         message_id: int,
     ) -> None:
         now = _utcnow_iso()
-        with self._conn() as conn:
+        with self._transaction() as conn:
             conn.execute(
                 """
                 INSERT INTO guild_stats_board(guild_id, channel_id, message_id, updated_at)
@@ -845,11 +864,11 @@ class Database:
             )
 
     def delete_guild_stats_board(self, *, guild_id: int) -> None:
-        with self._conn() as conn:
+        with self._transaction() as conn:
             conn.execute("DELETE FROM guild_stats_board WHERE guild_id=?", (int(guild_id),))
 
     def list_guild_stats_boards(self) -> list[dict]:
-        with self._conn() as conn:
+        with self._transaction() as conn:
             rows = conn.execute(
                 "SELECT guild_id, channel_id, message_id, updated_at FROM guild_stats_board"
             ).fetchall()
@@ -871,7 +890,7 @@ class Database:
         Outcomes and death causes come from ``games`` / ``game_players`` history.
         """
         gid = int(guild_id)
-        with self._conn() as conn:
+        with self._transaction() as conn:
             games_completed = int(
                 conn.execute(
                     "SELECT COUNT(*) AS n FROM games WHERE guild_id=?",
@@ -1099,7 +1118,7 @@ class Database:
     # --------------------
     # Import helper
     # --------------------
-    def assess_import_staleness(self, *, guild_id: int, stats_data: dict) -> Optional[str]:
+    def assess_import_staleness(self, *, guild_id: int, stats_data: dict, connection=None) -> Optional[str]:
         """
         Return a human-readable reason if SQLite looks newer than JSON (import would regress data).
         None means import is safe enough to proceed without force.
@@ -1117,7 +1136,51 @@ class Database:
                     json_wins = max(json_wins, int(rec.get("wins", 0) or 0))
                 except (TypeError, ValueError):
                     continue
-        with self._conn() as conn:
+        with (nullcontext(connection) if connection is not None else self._transaction()) as conn:
+            # Global maxima can hide a stale row for a newer or less active
+            # player. Compare exactly the counters this import would replace.
+            if isinstance(players, dict):
+                for pid, rec in players.items():
+                    if not isinstance(rec, dict):
+                        continue
+                    try:
+                        uid = int(pid)
+                        totals = {column: int(rec.get(key, 0)) for column, key in (
+                            ('games_played', 'games_played'), ('wins_total', 'wins'),
+                            ('losses_total', 'losses'), ('draws_total', 'draws'))}
+                        factions = rec.get('faction_wins') if isinstance(rec.get('faction_wins'), dict) else {}
+                        personal = migrate_personal_wins_dict(rec.get('personal_wins') if isinstance(rec.get('personal_wins'), dict) else {})
+                        for column, key in (('wins_town', 'Town'), ('wins_mafia', 'Mafia'), ('wins_arsonist', 'Arsonist')):
+                            totals[column] = max(0, int(factions.get(key, 0) or 0))
+                        if not totals['wins_arsonist']:
+                            totals['wins_arsonist'] = max(0, int(personal.get('arsonist_win', 0) or 0))
+                    except (TypeError, ValueError):
+                        continue  # The importer validates or skips malformed rows itself.
+                    existing = conn.execute('SELECT * FROM player_stats WHERE guild_id=? AND player_id=?', (gid, uid)).fetchone()
+                    stale = bool(existing and any(value < int(existing[column] or 0) for column, value in totals.items()))
+                    for key, count in personal.items():
+                        try:
+                            value = max(0, int(count))
+                        except (TypeError, ValueError):
+                            continue
+                        if value <= 0:
+                            continue  # Zero/missing personal counters do not overwrite existing rows.
+                        row = conn.execute('SELECT count FROM player_personal_stats WHERE guild_id=? AND player_id=? AND key=?', (gid, uid, str(key))).fetchone()
+                        stale |= bool(row and value < int(row['count'] or 0))
+                    played = rec.get('role_played') if isinstance(rec.get('role_played'), dict) else {}
+                    wins = rec.get('role_wins') if isinstance(rec.get('role_wins'), dict) else {}
+                    for role in set(played) | set(wins):
+                        try:
+                            rp, rw = max(0, int(played.get(role, 0) or 0)), max(0, int(wins.get(role, 0) or 0))
+                        except (TypeError, ValueError):
+                            continue
+                        if rp <= 0 and rw <= 0:
+                            continue
+                        row = conn.execute('SELECT played, wins_total FROM player_role_stats WHERE guild_id=? AND player_id=? AND role=?', (gid, uid, str(role))).fetchone()
+                        stale |= bool(row and (rp < int(row['played'] or 0) or rw < int(row['wins_total'] or 0)))
+                    if stale:
+                        return (f'SQLite has newer counters for player {uid}; the import was rejected without changes. '
+                            'Use `!importstats force` only for an intentional replacement.')
             row = conn.execute(
                 """
                 SELECT COUNT(*) AS n FROM games WHERE guild_id=?
@@ -1155,6 +1218,7 @@ class Database:
         guild_id: int,
         stats_data: dict,
         all_or_nothing: bool = True,
+        reject_stale: bool = False,
     ) -> int:
         """
         Import from the existing JSON stats structure into player_stats.
@@ -1165,9 +1229,13 @@ class Database:
             return 0
         now = _utcnow_iso()
         n = 0
-        with self._conn() as conn:
-            if all_or_nothing:
+        with self._transaction() as conn:
+            if all_or_nothing or reject_stale:
                 conn.execute("BEGIN IMMEDIATE")
+            if reject_stale:
+                reason = self.assess_import_staleness(guild_id=guild_id, stats_data=stats_data, connection=conn)
+                if reason:
+                    raise ValueError(reason)
             try:
                 n = self._import_player_stats_from_json_unlocked(
                     conn,
@@ -1303,13 +1371,14 @@ class Database:
         dedupe_key: str,
         target_user_id: int,
         content: str,
+        match_key: Optional[str] = None,
     ) -> Optional[int]:
         """Enqueue a DM; re-queue ``failed`` rows with the same dedupe key (e.g. GAME OVER)."""
         key = str(dedupe_key or "").strip()
         if not key:
             raise ValueError("enqueue_or_requeue_dm_outbox requires a non-empty dedupe_key")
         now = _utcnow_iso()
-        with self._conn() as conn:
+        with self._transaction() as conn:
             row = conn.execute(
                 "SELECT id, status FROM dm_outbox WHERE guild_id=? AND dedupe_key=? LIMIT 1",
                 (int(guild_id), key),
@@ -1327,11 +1396,11 @@ class Database:
             cur = conn.execute(
                 """
                 INSERT INTO dm_outbox(
-                    guild_id, kind, dedupe_key, target_user_id, content,
+                    guild_id, kind, dedupe_key, match_key, target_user_id, content,
                     status, created_at, not_before
-                ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
                 """,
-                (int(guild_id), str(kind), key, int(target_user_id), str(content), now, now),
+                (int(guild_id), str(kind), key, match_key, int(target_user_id), str(content), now, now),
             )
             return int(cur.lastrowid)
 
@@ -1343,21 +1412,22 @@ class Database:
         dedupe_key: str,
         target_user_id: int,
         content: str,
+        match_key: Optional[str] = None,
     ) -> Optional[int]:
         """Enqueue a user DM. ``dedupe_key`` is required; duplicates are ignored (returns None)."""
         key = str(dedupe_key or "").strip()
         if not key:
             raise ValueError("enqueue_dm_outbox requires a non-empty dedupe_key")
         now = _utcnow_iso()
-        with self._conn() as conn:
+        with self._transaction() as conn:
             cur = conn.execute(
                 """
                 INSERT OR IGNORE INTO dm_outbox(
-                    guild_id, kind, dedupe_key, target_user_id, content,
+                    guild_id, kind, dedupe_key, match_key, target_user_id, content,
                     status, created_at, not_before
-                ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
                 """,
-                (int(guild_id), str(kind), key, int(target_user_id), str(content), now, now),
+                (int(guild_id), str(kind), key, match_key, int(target_user_id), str(content), now, now),
             )
             if cur.rowcount == 0:
                 return None
@@ -1437,7 +1507,7 @@ class Database:
 
     def mark_dm_outbox_sent(self, msg_id: int) -> None:
         now = _utcnow_iso()
-        with self._conn() as conn:
+        with self._transaction() as conn:
             conn.execute(
                 "UPDATE dm_outbox SET status='sent', sent_at=?, sending_since=NULL WHERE id=?",
                 (now, int(msg_id)),
@@ -1451,7 +1521,7 @@ class Database:
         nb = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(seconds=delay_seconds)
         nb_iso = nb.isoformat()
         max_attempts = self.DM_OUTBOX_MAX_ATTEMPTS
-        with self._conn() as conn:
+        with self._transaction() as conn:
             row = conn.execute(
                 """UPDATE dm_outbox SET attempts = attempts + 1, last_error=?, sending_since=NULL
                    WHERE id=? RETURNING attempts""",
@@ -1478,10 +1548,19 @@ class Database:
     def requeue_stale_dm_outbox_sending(self, *, stale_after_seconds: int = 300) -> int:
         cutoff = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(seconds=int(stale_after_seconds))
         cutoff_iso = cutoff.isoformat()
-        with self._conn() as conn:
+        with self._transaction() as conn:
             cur = conn.execute(
                 """UPDATE dm_outbox SET status='pending', sending_since=NULL
                    WHERE status='sending' AND sending_since IS NOT NULL AND sending_since<=?""",
                 (cutoff_iso,),
             )
             return int(cur.rowcount)
+
+    def mark_dm_outbox_superseded(self, msg_id):
+        with self._transaction() as conn:
+            conn.execute("UPDATE dm_outbox SET status='superseded', sending_since=NULL WHERE id=?", (msg_id,))
+
+    def defer_dm_outbox(self, msg_id, *, delay_seconds=12):
+        deadline = (datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)).isoformat()
+        with self._transaction() as conn:
+            conn.execute("UPDATE dm_outbox SET status='pending', sending_since=NULL, not_before=? WHERE id=?", (deadline,msg_id))

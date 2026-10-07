@@ -10,15 +10,21 @@ permissions:
 jobs:
   tests:
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.14.8', '3.12']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: ${{ matrix.python-version }}
       - name: Install dependencies
-        run: python -m pip install -r requirements.txt -r requirements-dev.txt
+        run: python -m pip install -c constraints.txt -r requirements.txt -r requirements-dev.txt
+      - name: Dependency consistency
+        run: python -m pip check
       - name: Regression tests
-        run: python scripts/run_bounded_tests.py -o addopts= -ra
+        run: python scripts/run_bounded_tests.py --isolated -ra
       - name: Standalone smoke suite
         run: python smoke_test.py
       - name: Bounded engine checks

@@ -265,48 +265,50 @@ Retained replay fixtures are synthetic. Some replay collections are empty and ap
 
 ### CI and validation scope
 
-[Windows/Python 3.12 CI](.github/workflows/tests.yml) runs the bounded pytest launcher, the standalone smoke suite, 200 seeded engine iterations, and the simulator role audit on pushes and pull requests. The October 6, 2026 integration checks passed **257 pytest tests, with four skipped empty replay collections**, plus the standalone smoke suite, 47 engine scenarios with 200 seeded fuzz iterations, the 32-role audit, 50 generated matches with two workers, and 10 fixed-lineup matches including all five restored roles. This describes the published snapshot's checks, not every optional large experiment.
+[Windows/Python 3.14.8 and 3.12 CI](.github/workflows/tests.yml) installs the dependency set in `constraints.txt` and runs the bounded pytest launcher, the standalone smoke suite, 200 seeded engine iterations, and the simulator role audit on pushes and pull requests. The October 6, 2026 gameplay and compatibility checks passed **451 pytest tests, with three skipped empty replay collections**, plus 47 engine scenarios with 200 seeded fuzz iterations and the 32-role audit on both Python versions. The earlier integration pass also exercised 50 generated matches with two workers and 10 fixed-lineup matches including all five restored roles. These are bounded checks, not every optional large experiment.
+
+The five added roles now have [upgraded private controls](docs/MODERN_GAMEPLAY.md#controls-for-the-five-added-roles): Deputy day shots with a final Fire confirmation, explicit Serial Killer mode buttons, preselected Guardian Angel wards, and Seer/Psychic report cards with persistent private histories. Reopen these with `/actions` or `!actions`. Existing role rules and command syntax remain in place.
 
 Regression coverage includes database/outbox behavior, restart recovery, private-channel guards, configuration validation, and specific role interactions. Larger fuzzing and property runs are available separately; consult each script's `--help` and the [simulation guide](docs/SIMULATION.md).
 
-All publication checks ran without a real Discord gateway session. Live permissions, message delivery, reconnect behavior, and social gameplay require server validation and human playtesting.
+These checks use Discord test doubles. On October 6, 2026, the project owner waived the live-server test as a prerequisite for the Python 3.14 upgrade. A real Discord test remains available as an optional check; no live gateway test was performed.
 
 ## Persistence, recovery, and delivery
 
 ### Active-game snapshots
 
-[`persistence.py`](persistence.py) stores JSON snapshots through a temporary file followed by replacement. Game serialization retains player identifiers, roles, resources, actions, phase state, and tribunal fields. On startup, the bot reconstructs member references and attempts to repair game roles and voice permissions.
+[`persistence.py`](persistence.py) stores JSON snapshots through a temporary file followed by replacement. Game serialization retains player identifiers, roles, resources, actions, phase state, and tribunal fields. On startup, the bot reconstructs member references and repairs game roles and private-channel access before reopening gameplay. Saved player IDs remain intact while recovery is pending. Temporary file-read or member-lookup failures defer recovery; only a confirmed missing member counts as a departure. Existing graveyard entries remain dead without applying their consequences twice.
 
-Phase changes, ability-use accounting, tribunal verdicts, and endgame handling have guards against repeated execution. A persisted game key also prevents repeat match/stat submissions. These mechanisms address different duplicate paths; they are not a universal transaction across Discord and local storage.
+A saved startup checkpoint resumes the original role assignment after interruption. Trial and night completion records retain unfinished announcements across later phases. Access cleanup and logical verdict application continue independently of public-message failures. Phase changes, ability-use accounting, tribunal verdicts, and endgame handling have guards against repeated execution. A persisted game key also prevents repeat match/stat submissions. These mechanisms address different duplicate paths; they are not a universal transaction across Discord and local storage.
 
 ### Queued role messages
 
-The SQLite DM outbox stores target users, content, deduplication keys, status, attempts, and retry timing. Role-deal messages are queued after game state is saved. The pump claims pending batches, marks delivered messages, schedules retries, and recovers entries left in a stale sending state.
+The SQLite DM outbox stores target users, content, deduplication keys, match identity, status, attempts, and retry timing. Role-deal messages are queued after game state is saved. The pump claims pending batches, marks delivered messages, schedules retries, and recovers entries left in a stale sending state. SQLite operations run outside the event loop and always close their connections. Messages from a superseded match are discarded, including during restart before the saved match is fully loaded. In-flight private delivery is drained before a new match starts.
 
 This queue covers role assignment and associated startup messages. Other private feedback uses direct sends. A crash between Discord delivery and the local acknowledgement can still lead to a repeated send, so the design does not promise exactly-once delivery.
 
 ### Connection handling
 
-The bot includes a single-instance lock, gateway monitoring, reconnect handling, and command-sync controls. Running one process per installation avoids competing writers and duplicate command handling. A server operator still needs to supervise the process, preserve its runtime state, and verify the permissions required by the game.
+The bot includes a single-instance lock, gateway monitoring, reconnect handling, and command-sync controls. A watchdog restart drains pending work and recreates the HTTP session, connector, and loop bindings; it preserves the canonical game object for recovery. Running one process per installation avoids competing writers and duplicate command handling. A server operator still needs to supervise the process, preserve its runtime state, and verify the permissions required by the game.
 
 ## Player statistics and leaderboards
 
 SQLite stores matches and participant records alongside aggregate and per-role statistics. Participant records preserve starting-role information even if a player is promoted or converted, while faction outcomes and personal wins are tracked separately.
 
-`!stats` provides a player summary. `/leaderboard` opens selectable views for overall wins, faction wins, personal objectives, and win rate; the win-rate query applies a minimum-games threshold. Legacy JSON statistics can be imported through the overseer command.
+`!stats` provides a player summary. `/leaderboard` opens selectable views for overall wins, faction wins, personal objectives, and win rate; the win-rate query applies a minimum-games threshold. The overseer can import legacy JSON statistics with `!importstats`. The default rejects any imported counter that would replace newer data, within the same SQLite transaction as the import. `!importstats force` explicitly permits an intentional replacement.
 
 The database uses a unique durable game key to identify a committed match and avoid adding the same match twice. History supports aggregate analysis and player progress; this repository does not provide a complete action-by-action match replay interface.
 
 ## Run on your server
 
-Use **Python 3.12**, the version used by CI. Each installation is configured for one allowed guild.
+Use **standard 64-bit CPython 3.14.8**. The default launcher selects `.venv314`; Python 3.12 remains covered by CI and the existing `.venv` is preserved for rollback. Each installation is configured for one allowed guild. See the [runtime and rollout notes](docs/MODERN_GAMEPLAY.md).
 
 ```powershell
 git clone https://github.com/chentaot1/mafiabot.git
 cd mafiabot
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
+py -3.14 -m venv .venv314
+.\.venv314\Scripts\Activate.ps1
+python -m pip install -c constraints.txt -r requirements.txt
 Copy-Item .env.example .env
 ```
 
@@ -324,7 +326,8 @@ Server IDs are not built into the published configuration. Invalid or missing re
 Enable **Server Members** and **Message Content** intents in the Discord application. Invite the bot with bot and application-command scopes. It needs permission to manage the game channels and roles, move members, send messages, add reactions, read message history, and use the relevant voice channels. Put its role above the roles it must manage. Players must allow DMs for the start check and private game feedback.
 
 ```powershell
-python bot.py
+.\scripts\run_bot.ps1 -Check
+.\scripts\run_bot.ps1
 ```
 
 Gather at least five players with `!join`, then use the configured overseer account to run `!startgame`, `!vote`, `!night`, `!resolve`, and `!day` as appropriate. Consult the [player guide](MAFIA_GAME_GUIDE.md) for complete role commands.
@@ -332,12 +335,14 @@ Gather at least five players with `!join`, then use the configured overseer acco
 ### Run the bounded checks
 
 ```powershell
-python -m pip install -r requirements-dev.txt
-python scripts/run_bounded_tests.py -o addopts= -ra
+python -m pip install -c constraints.txt -r requirements-dev.txt
+python scripts/run_bounded_tests.py --isolated -ra
 python smoke_test.py
 python scripts/sim_test.py --skip-exhaustive --fuzz-iterations 200 --seed 12345
 python scripts/monte_carlo_sim.py --audit
 ```
+
+The `--isolated` regression profile disables dotenv loading, uses fake Discord settings and temporary state, and constructs commands without connecting to Discord. Standalone smoke and simulator commands above use their existing test doubles.
 
 Tokens, live server state, databases, logs, and generated simulation reports are excluded from Git. Preserve your own runtime files when upgrading; do not commit them to a public fork.
 

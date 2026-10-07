@@ -36,6 +36,7 @@ CHAOS_USED_THIS_NIGHT_KEY = "chaos_used_this_night"
 START_NIGHT_ONLY_CLEAR_KEYS: Tuple[str, ...] = (
     CHAOS_USED_THIS_NIGHT_KEY,
     "sk_counter_kills",
+    "seer_submitted_targets",
 )
 
 # Sim harness mirrors start_night + pipeline keys.

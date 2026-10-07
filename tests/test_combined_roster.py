@@ -16,6 +16,7 @@ from scripts.monte_carlo import bridge
 @pytest.fixture
 def model(monkeypatch):
     monkeypatch.setattr(gm, 'active_games', {})
+    monkeypatch.setattr(gm, '_BOT', None)
     game = Game(123)
     game.in_progress, game.phase, game.day_number, game.game_key = True, 'night', 2, 'combined'
     game.gameplay['night_token'] = 'night-2'

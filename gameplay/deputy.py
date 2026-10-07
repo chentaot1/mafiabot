@@ -4,8 +4,8 @@ from . import state as st
 from .death import apply_death
 
 
-async def fire(game, actor_id, target_id, *, guild=None):
-    expected = st.identity(game)
+async def fire(game, actor_id, target_id, *, guild=None, expected=None):
+    expected = st.identity(game) if expected is None else expected
     if guild:
         await game.sync_living_players(guild)
     def update():

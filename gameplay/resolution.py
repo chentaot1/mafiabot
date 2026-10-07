@@ -16,6 +16,20 @@ async def evaluate(game, guild):
     from night_resolve_prep import expand_reanimate_for_night_resolve, notify_reanimate_expand_failures
     from retributionist_consumption import consume_retributionist_uses
     from night_guilt import tally_guilt_and_jester_deaths
+    from night_resume import parse_night_resume_state, coerce_snap_id_list, night_kill_deaths_from_snap
+    resume = parse_night_resume_state(game.night_completion_snapshot, day_number=game.day_number, game_key=game.game_key)
+    if resume.resume_post_pipeline_only:
+        # A legacy completed engine is a result, not permission to execute spent actions again.
+        snap = game.night_completion_snapshot
+        deaths = set(coerce_snap_id_list(snap, 'deaths')) | night_kill_deaths_from_snap(snap)
+        blocked = coerce_snap_id_list(snap, 'blocked')
+        if not snap.get('retri_consumption_done'):
+            consume_retributionist_uses(game, blocked, {})
+        guilt, haunts = await tally_guilt_and_jester_deaths(game, guild, deaths, night_kill_deaths_from_snap(snap))
+        game.living_players = [p for p in game.living_players if p.id not in deaths]
+        if not snap.get('psychic_visions_delivered'):
+            await deliver_psychic_visions(game, guild, blocked)
+        return deaths, guilt, haunts
     failed = expand_reanimate_for_night_resolve(game)
     await notify_reanimate_expand_failures(game, guild, failed)
     visits, blocked, healed, protected, deaths = await run_night_pipeline(game, guild)
@@ -100,6 +114,7 @@ async def run(game, ctx):
             game.gameplay["resolution"] = {"night_token": expected[2], "applied": True,
                 "day":game.day_number, "feedback": feedback, "feedback_index": 0, "death_ids": sorted(deaths),
                 "progressed": False, "public_delivery_pending":False}
+            game.gameplay.setdefault('resolutions', {})[expected[2]] = game.gameplay['resolution']
         await st.commit(game, apply)
         applied = True
         await finish(game, ctx)
@@ -108,7 +123,7 @@ async def run(game, ctx):
             def release():
                 if st.identity(game) == expected and game.in_progress and not game.ending:
                     game.resolving = False
-            await st.commit(game, release, persist=game.in_progress and not game.ending)
+            await st.commit(game, release, persist=game.in_progress and not game.ending, allow_recovery=True)
 
 
 async def finish(game, ctx):
@@ -135,20 +150,30 @@ async def _finish(game, ctx):
             game.gameplay['resolution']['public_delivery_pending']=True
         await st.commit(game,defer_public)
     for uid in record["death_ids"]:
-        if not public_available:
-            continue
         receipt = game.gameplay["deaths"].get(str(uid))
         if receipt and not receipt.get("delivered"):
-            await game.deliver_death_receipt(ctx, ctx.guild, receipt)
-            if not receipt.get("delivered"):
-                raise OSError("Death delivery pending")
+            await game.deliver_death_receipt(ctx if public_available else None, ctx.guild, receipt)
+            if not receipt.get('delivered'):
+                def pending():
+                    st.require_current(game, phase='night', expected=expected)
+                    game.gameplay['resolution']['public_delivery_pending'] = True
+                await st.commit(game, pending)
     while record["feedback_index"] < len(record["feedback"]):
         index = record["feedback_index"]
         item = record["feedback"][index]
         member = await game.get_member_safe(ctx.guild, item["user_id"])
         if member:
             try:
-                await member.send(item["text"])
+                from game import try_get_bot
+                from . import reports
+                from .views import ReportCard, NO_MENTIONS
+                controller = getattr(try_get_bot(), 'gameplay_controller', None)
+                report = reports.for_feedback(game, item['user_id'], item['text'], record.get('day', game.day_number))
+                if report and controller:
+                    destination = await controller.private_destination(game, item['user_id'])
+                    await destination.send(view=ReportCard(game, report), allowed_mentions=NO_MENTIONS)
+                else:
+                    await member.send(item["text"])
             except discord.Forbidden:
                 pass
         def delivered():
@@ -159,3 +184,8 @@ async def _finish(game, ctx):
     if await game.check_win_conditions():
         return
     await game.start_day(ctx, resolution_token=expected[2])
+    from game import try_get_bot
+    controller = getattr(try_get_bot(), 'gameplay_controller', None)
+    if controller and record.get('public_delivery_pending') and game.in_progress:
+        controller.start_job((game.guild_id, 'resolution-delivery', expected[2]),
+            lambda: controller.deliver_deferred_resolution(game, expected[2]))

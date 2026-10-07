@@ -30,6 +30,13 @@ def load_ui(raw):
     token = raw.get('night_token')
     if identifier(token):
         result['night_token']=token
+    startup = raw.get('startup')
+    if isinstance(startup, dict) and isinstance(startup.get('match'), str):
+        completed = startup.get('completed_players', [])
+        result['startup'] = {'match': startup['match'], 'complete': startup.get('complete') is True,
+            'announced': startup.get('announced') is True,
+            'mafia_announced': startup.get('mafia_announced') is True,
+            'completed_players': [uid for uid in completed if integer(uid)] if isinstance(completed, list) else []}
     duels=raw.get('duels')
     if isinstance(duels,dict):
         for key,action in duels.items():
@@ -51,7 +58,12 @@ def load_ui(raw):
                 continue
             if not all(isinstance(receipt.get(k),list) and all(integer(x) for x in receipt[k]) for k in ('voters','converted')):
                 continue
-            result['deaths'][str(uid)]=deepcopy(receipt)
+            saved = deepcopy(receipt)
+            for key in ('delivered', 'access_cleaned', 'notices_delivered'):
+                saved[key] = saved.get(key) is True
+            if not integer(saved.get('announcement_id')):
+                saved['announcement_id'] = None
+            result['deaths'][str(uid)] = saved
     trial=raw.get('trial')
     if isinstance(trial,dict) and identifier(trial.get('id')) and integer(trial.get('day')):
         stage=trial.get('stage')
@@ -84,15 +96,35 @@ def load_ui(raw):
             page=trial.get('display_page',0)
             trial['display_page']=max(0,page) if integer(page) else 0
             result['trial']=trial
-    record=raw.get('resolution')
-    if (isinstance(record,dict) and identifier(record.get('night_token')) and record.get('applied') is True
-            and (record.get('night_token')==token or record.get('progressed') is True)):
-        feedback=record.get('feedback'); index=record.get('feedback_index'); ids=record.get('death_ids')
-        if (isinstance(feedback,list) and all(isinstance(x,dict) and integer(x.get('user_id')) and isinstance(x.get('text'),str) for x in feedback)
-                and integer(index) and 0<=index<=len(feedback) and isinstance(ids,list) and all(integer(x) for x in ids)):
-            result['resolution']=deepcopy(record)
-            result['resolution']['progressed']=record.get('progressed') is True
-            result['resolution']['public_delivery_pending']=record.get('public_delivery_pending') is True
+    result['trials'] = {}
+    archives = raw.get('trials', {})
+    if isinstance(archives, dict):
+        for key, saved in archives.items():
+            if (identifier(key) and isinstance(saved, dict) and saved.get('id') == key
+                    and saved.get('stage') in ('done', 'cancelled')):
+                validated = load_ui({'version': 1, 'trial': saved})['trial']
+                if validated:
+                    result['trials'][key] = validated
+    if result['trial'] and result['trial']['id'] in result['trials']:
+        result['trials'][result['trial']['id']] = result['trial']
+    result['resolutions'] = {}
+    records = raw.get('resolutions', {})
+    records = dict(records) if isinstance(records, dict) else {}
+    current = raw.get('resolution')
+    if isinstance(current, dict) and identifier(current.get('night_token')):
+        records[current.get('night_token')] = current
+    for record in records.values():
+        if (isinstance(record,dict) and identifier(record.get('night_token')) and record.get('applied') is True
+                and (record.get('night_token')==token or record.get('progressed') is True)):
+            feedback=record.get('feedback'); index=record.get('feedback_index'); ids=record.get('death_ids')
+            if (isinstance(feedback,list) and all(isinstance(x,dict) and integer(x.get('user_id')) and isinstance(x.get('text'),str) for x in feedback)
+                    and integer(index) and 0<=index<=len(feedback) and isinstance(ids,list) and all(integer(x) for x in ids)):
+                saved=deepcopy(record)
+                saved['progressed']=record.get('progressed') is True
+                saved['public_delivery_pending']=record.get('public_delivery_pending') is True
+                result['resolutions'][saved['night_token']]=saved
+    if isinstance(current, dict) and identifier(current.get('night_token')) and current.get('night_token') in result['resolutions']:
+        result['resolution'] = result['resolutions'][current['night_token']]
     return result
 
 

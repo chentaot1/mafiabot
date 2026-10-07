@@ -265,3 +265,44 @@ def test_obsolete_resume_task_does_not_clean_up_a_new_game(bot_module, monkeypat
     assert new.tribunal_defendant_id == 2
     old.persist_flush.assert_not_awaited()
     assert channel.sent == []
+
+
+@pytest.mark.parametrize('failure_at', ['send', 'add_reaction', 'fetch', 'users', 'users_and_notice'])
+@pytest.mark.parametrize('status', [403, 503])
+def test_legacy_trial_api_failure_cancels_without_partial_verdict(bot_module, monkeypatch, failure_at, status):
+    module = bot_module
+    game, guild, channel, players, _ = setup_game(module, monkeypatch, 'day')
+    game.vote_in_progress = game.tribunal_muted = True
+    game.tribunal_defendant_id = 1
+    game.tribunal_subphase = 'defense'
+    game.votes_today = 1
+    game.process_death = AsyncMock()
+    monkeypatch.setattr(module.asyncio, 'sleep', AsyncMock())
+    error_type = module.discord.Forbidden if status == 403 else module.discord.HTTPException
+    error = error_type(SimpleNamespace(status=status, reason='unavailable'), 'unavailable')
+    if failure_at == 'send':
+        channel.send = AsyncMock(side_effect=error)
+    elif failure_at == 'add_reaction':
+        channel.message.add_reaction.side_effect = error
+    elif failure_at == 'fetch':
+        channel.fetch_message = AsyncMock(side_effect=error)
+    else:
+        async def partial_users():
+            yield players[1]
+            raise error
+        channel.message.reactions = [SimpleNamespace(emoji='✅', users=partial_users)]
+        if failure_at == 'users_and_notice':
+            original_send = channel.send
+            async def send(content=None, **kwargs):
+                if content and 'cancelled' in content:
+                    raise error
+                return await original_send(content, **kwargs)
+            channel.send = send
+
+    asyncio.run(module._resume_tribunal_defense_after_restart(guild, 0))
+    game.process_death.assert_not_awaited()
+    assert not game.vote_in_progress and not game.tribunal_muted
+    assert game.tribunal_defendant_id is None and game.tribunal_subphase is None
+    channel.set_permissions.assert_awaited_with(20, speak=True)
+    if failure_at not in {'send', 'users_and_notice'}:
+        assert any(isinstance(text, str) and 'cancelled' in text for text in channel.sent)

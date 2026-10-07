@@ -4,7 +4,7 @@ MafiaBot runs an overseer-led social deduction game on Discord. There are 32 con
 
 ## Starting and playing
 
-Join with `!join`; the overseer starts with `!startgame`. The game checks that players can receive DMs before dealing roles. Players should keep DMs enabled for role assignments and private feedback. The bot creates or reuses the game's text/voice channels and roles; server permissions must be configured correctly.
+Join with `!join`; the overseer starts with `!startgame`. The game checks that players can receive DMs before dealing roles. Players should keep DMs enabled for role assignments and private feedback. The bot creates or reuses the game's text/voice channels and roles; server permissions must be configured correctly. Interrupted setup resumes the saved role assignment, and gameplay waits until setup finishes.
 
 Day is for discussion and tribunal voting. The overseer starts a trial with `!vote`; private nomination controls lead to defense, judgment, and a verdict. A revealed Mayor has double vote weight. A tie or no nomination spares the town from that trial. There are at most two trials per day.
 
@@ -18,7 +18,7 @@ Five-player games use one Investigative Town, one Protective Town, two Random To
 
 Retributionist, Survivor, Scary Grandma, Gatekeeper, and Chaos start with one charge in games of seven or fewer players and two above seven. Other quantities in the role cards below apply as written. When a card says two charges, the small-lobby adjustment still applies.
 
-`!myrole` gives your role card in a DM. `!players` lists seat numbers; `!will` opens or clears your will, subject to the current game's eligibility checks. `/leaderboard` and `!stats` show recorded results. Neutral personal victories are separate from faction outcomes.
+`!myrole` gives your role card in a DM. `!players` lists seat numbers; `!will` opens or clears your will while you are living. Your recorded will is frozen at death. `/leaderboard` and `!stats` show recorded results. Neutral personal victories are separate from faction outcomes.
 
 ## Role roster
 

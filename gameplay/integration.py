@@ -11,13 +11,16 @@ from . import state as st, trials
 
 
 async def start_night(game, ctx, *, trial_token=None):
+    st.require_current(game)
     expected = st.identity(game)
+    previous_panels = deepcopy(game.gameplay.get('panels', {}))
     if game.phase == 'day' and game.in_progress and not game.ending:
         if await game._close_bloodless_cycle_and_maybe_draw():
             return
     if game.phase != 'night' and game.in_progress and not game.ending:
         await game._process_deferred_guilt_at_night_start(ctx)
     def transition():
+        st.require_current(game)
         if not game.in_progress or game.ending or game.phase == 'night':
             return False
         if expected != st.identity(game):
@@ -48,6 +51,9 @@ async def start_night(game, ctx, *, trial_token=None):
         return True
     if not await st.commit(game, transition):
         return
+    controller = getattr(try_get_bot(), 'gameplay_controller', None)
+    if controller:
+        await controller.close_night_panels(previous_panels)
     day_vc = ctx.guild.get_channel(game.day_vc_id) if game.day_vc_id else None
     alive_role = ctx.guild.get_role(game.alive_role_id) if game.alive_role_id else None
     if day_vc and alive_role:
@@ -55,17 +61,21 @@ async def start_night(game, ctx, *, trial_token=None):
             await day_vc.set_permissions(alive_role, speak=False)
         except discord.HTTPException:
             pass
-    await ctx.send(f'🌙 It is now **Night {game.day_number}**. Use /actions or your private night panel.')
+    try:
+        await ctx.send(f'🌙 It is now **Night {game.day_number}**. Use /actions or your private night panel.')
+    except discord.HTTPException:
+        pass  # Panels and the committed phase do not depend on public send access.
     await game.sync_living_players(ctx.guild)
-    controller = getattr(try_get_bot(), 'gameplay_controller', None)
     if controller:
         await controller.send_night_panels(game)
 
 
 async def start_day(game, ctx, *, resolution_token=None):
+    st.require_current(game)
     expected = st.identity(game)
     previous_panels = deepcopy(game.gameplay.get('panels', {}))
     def transition():
+        st.require_current(game)
         if not game.in_progress or game.ending or game.phase == 'day':
             return False
         if expected != st.identity(game):
@@ -78,6 +88,7 @@ async def start_day(game, ctx, *, resolution_token=None):
         game.resolving = False
         game.phase = 'day'
         game.day_number += 1
+        game.gameplay['panels'] = {}
         game.votes_today = 0
         trials.clear_flags(game)
         game.night_completion_snapshot = None
@@ -95,7 +106,18 @@ async def start_day(game, ctx, *, resolution_token=None):
         alive = ctx.guild.get_role(game.alive_role_id) if game.alive_role_id else None
         if vc and alive:
             await vc.set_permissions(alive, connect=True, speak=True)
-    await ctx.send(f'☀️ The sun rises on **Day {game.day_number}**. Remaining players: {len(game.living_players)}')
+    try:
+        await ctx.send(f'☀️ The sun rises on **Day {game.day_number}**. Remaining players: {len(game.living_players)}')
+    except discord.HTTPException:
+        if resolution_token:
+            def pending():
+                st.require_current(game, phase='day')
+                record = game.gameplay.get('resolutions', {}).get(resolution_token) or game.gameplay.get('resolution')
+                if record and record.get('night_token') == resolution_token:
+                    record['public_delivery_pending'] = True
+            await st.commit(game, pending)
+    if controller:
+        await controller.send_day_panels(game)
     from messages import tos
     for uid, role in game.player_roles.items():
         state = game.role_states.get(uid, {})
@@ -104,7 +126,7 @@ async def start_day(game, ctx, *, resolution_token=None):
             def clear_notice():
                 state['ga_announce_pending'] = False
             await st.commit(game, clear_notice)
-        if role == 'Deputy' and game.day_number >= 2 and state.get('deputy_shots_remaining', 0) > 0:
+        if controller is None and role == 'Deputy' and game.day_number >= 2 and state.get('deputy_shots_remaining', 0) > 0:
             member = await game.get_member_safe(ctx.guild, uid)
             if member and uid in {p.id for p in game.living_players}:
                 try:
@@ -117,10 +139,17 @@ async def reset(game, guild, *, nuke=False, _from_check_win=False):
     def invalidate():
         game.ending = True
         game.gameplay['night_token'] = None
-    await st.commit(game, invalidate, persist=False)
+    await st.commit(game, invalidate, persist=False, allow_recovery=True)
     controller = getattr(try_get_bot(), 'gameplay_controller', None)
     if controller:
         await controller.stop_game(game)
+    # Drain startup API requests before removing roles; never hold this lock
+    # while waiting for endgame, whose owner may itself request cleanup.
+    async with game._startup_lock:
+        pass
+    from .lifecycle import message_lock
+    async with message_lock(game.guild_id):
+        pass
     if nuke:
         await game._historical_nuke_reset(guild)
     else:

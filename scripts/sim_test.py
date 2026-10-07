@@ -895,6 +895,7 @@ async def scenario_retributionist_reanimate_doctor_heals() -> None:
     game.role_states[1] = {"uses_remaining": 2, "used_corpses": []}
     # Mark doctor corpse in graveyard.
     game.graveyard = [{"player_id": 2, "real_role": "Doctor"}]
+    game.living_players = [p for p in game.living_players if p.id != 2]
     # Retributionist reanimates doctor to heal 4; mobster attacks 4.
     game.night_actions[1] = {"type": "reanimate", "actor": 1, "role": "Retributionist", "corpse_player_id": 2, "corpse_role": "Doctor", "target": 4}
     game.night_actions[3] = {"type": "kill", "actor": 3, "role": "Mobster", "target": 4}

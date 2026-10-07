@@ -124,6 +124,10 @@ _VISIT_REDIRECT_ACK_TYPES = frozenset(
 _BOT: Optional[commands.Bot] = None
 
 
+class MemberLookupUnavailable(OSError):
+    """An API/cache failure is not evidence that a player departed."""
+
+
 def bind_bot(bot: commands.Bot) -> None:
     global _BOT
     _BOT = bot
@@ -225,8 +229,13 @@ class Game:
         self._reset_lock: asyncio.Lock = asyncio.Lock()
         self._reset_in_progress: bool = False
         self._rehydrate_pending: bool = False
+        self._recovering_permissions: bool = False
         self._check_win_active: bool = False
         self._lobby_lock: asyncio.Lock = asyncio.Lock()
+        self._startup_lock = asyncio.Lock()
+        self._rehydrate_lock = asyncio.Lock()
+        self._persist_player_ids = []
+        self._persist_living_ids = []
         self._file_write_lock: threading.Lock = threading.Lock()
         self.state_lock = asyncio.Lock()
         self._phase_transition_lock = asyncio.Lock()
@@ -234,14 +243,23 @@ class Game:
         self.action_cooldowns = {}
         self.gameplay = {"version": 1, "trial": None, "panels": {}, "night_token": None, "deaths": {}, "duels": {}}
 
+    def _graveyard_player_ids(self) -> Set[int]:
+        """Ignore malformed legacy metadata when deriving authoritative dead ids."""
+        from persist_schema import coerce_opt_int
+        dead = set()
+        for entry in self.graveyard or []:
+            raw = entry.get('player_id') if isinstance(entry, dict) else None
+            if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+                continue
+            player_id = coerce_opt_int(raw)
+            if player_id is not None and player_id > 0:
+                dead.add(player_id)
+        return dead
+
     @staticmethod
     def living_ids_excluding_graveyard(game: "Game") -> List[int]:
         """Living roster ids derived from roles minus graveyard (for stats retry)."""
-        dead = {
-            int(e["player_id"])
-            for e in (game.graveyard or [])
-            if isinstance(e, dict) and e.get("player_id") is not None
-        }
+        dead = game._graveyard_player_ids()
         out: List[int] = []
         for pid in game.player_roles:
             try:
@@ -370,8 +388,22 @@ class Game:
         return False
 
     async def commit_endgame_stats_async(self, *, outcome: str, living_ids: List[int]) -> None:
-        """Thread-safe stats commit serialized with ``persist_flush`` via ``_file_write_lock``."""
-        await asyncio.to_thread(self._commit_endgame_stats, outcome=outcome, living_ids=living_ids)
+        """Commit a detached model and drain its worker before reset can clear state."""
+        from copy import copy, deepcopy
+        from async_work import run_blocking
+        async with self.state_lock:
+            working = copy(self)
+            for field in ('player_roles', 'role_states', 'graveyard', 'night', 'tribunal_state', 'gameplay'):
+                setattr(working, field, deepcopy(getattr(self, field)))
+            working.players = list(self.players)
+            working.living_players = list(self.living_players)
+            try:
+                await run_blocking(working._commit_endgame_stats, outcome=outcome, living_ids=list(living_ids))
+            finally:
+                # The worker is finished even when cancellation is propagated.
+                self.stats_committed = working.stats_committed
+                self.refresh_stats_board = working.refresh_stats_board
+                self.game_key, self.started_at = working.game_key, working.started_at
 
     def _commit_endgame_stats(self, *, outcome: str, living_ids: List[int]) -> None:
         """
@@ -636,110 +668,48 @@ class Game:
     def from_persisted(data: Dict) -> "Game":
         return game_from_persisted(data)
 
+    async def lookup_member(self, guild, user_id):
+        """Only an authoritative 404 means departure; transient errors abort reconciliation."""
+        uid = int(user_id)
+        member = guild.get_member(uid)
+        if member is not None:
+            return member
+        try:
+            return await guild.fetch_member(uid)
+        except discord.NotFound:
+            return None
+        except (discord.Forbidden, discord.HTTPException) as error:
+            raise MemberLookupUnavailable('Cannot verify server membership; retry shortly.') from error
+
     async def rehydrate_members(self, guild: discord.Guild) -> None:
-        player_ids = getattr(self, "_persist_player_ids", [])
-        living_ids = getattr(self, "_persist_living_ids", [])
-        players: List[discord.Member] = []
-        living: List[discord.Member] = []
-        # Track persisted-living members we couldn't fetch — they left the server
-        # mid-game and must be treated as deaths (audit #20, ToS-aligned). Doing
-        # the announcement loop AFTER we've populated self.living_players keeps
-        # process_death_by_id's living_ids gate consistent.
-        leaver_ids: List[int] = []
-        already_dead_ids: Set[int] = {
-            int(entry.get("player_id"))
-            for entry in (self.graveyard or [])
-            if isinstance(entry, dict) and entry.get("player_id") is not None
-        }
-        for pid in player_ids:
-            m = await self.get_member_safe(guild, pid)
-            if m:
-                players.append(m)
-        for lid in living_ids:
-            try:
-                lid_int = int(lid)
-            except (TypeError, ValueError):
-                continue
-            if lid_int in already_dead_ids:
-                continue
-            m = await self.get_member_safe(guild, lid_int)
-            if m:
-                living.append(m)
-            elif lid_int not in already_dead_ids:
-                leaver_ids.append(lid_int)
-        self.players = players
-        self.living_players = living
-        if hasattr(self, "_persist_player_ids"):
-            delattr(self, "_persist_player_ids")
-        if hasattr(self, "_persist_living_ids"):
-            delattr(self, "_persist_living_ids")
-
-        # Record leaver deaths inline so check_win_conditions doesn't
-        # under-count factions. We can't reuse process_death_by_id here
-        # because its `if player_id not in living_ids: return` gate would
-        # short-circuit (the leaver isn't in self.living_players, since we
-        # just rebuilt it from members we could actually fetch).
-        if leaver_ids and self.in_progress:
-            for lid in leaver_ids:
-                # Idempotent across multiple rehydrate calls.
-                if int(lid) in {
-                    int(e.get("player_id"))
-                    for e in self.graveyard
-                    if isinstance(e, dict) and e.get("player_id") is not None
-                }:
-                    continue
-                real_role = self.player_roles.get(int(lid), "Unknown")
-                from death_side_effects import apply_core_death_bookkeeping
-
-                apply_core_death_bookkeeping(
-                    self,
-                    int(lid),
-                    real_role=real_role,
-                    cause="left",
-                    is_hidden=False,
-                    record_cycle=True,
-                )
-                await post_game_channel(
-                    self,
-                    guild,
-                    tos_msg.player_left_presumed_dead(f"<@{int(lid)}>", real_role),
-                )
-                # Audit C2 — Executioner→Jester conversion sweep. A leaver
-                # is a non-lynch death; if they were an Exe's target, the
-                # Exe must convert to Jester or they're permanently
-                # unwinnable. Mirrors the same sweep in process_death and
-                # process_death_by_id.
-                await self._sweep_executioner_conversion_for(guild, dead_player_id=int(lid), cause="left")
-                # Audit (deep review) — parity with process_death_by_id: a leaver
-                # has no fetchable Member, but their mafia-chat overwrite must
-                # still be cleared so a returning account does not retain Mafia
-                # read access from before they left.
-                mafia_tc = guild.get_channel(self.mafia_tc_id) if self.mafia_tc_id else None
-                if mafia_tc is not None:
-                    try:
-                        await mafia_tc.set_permissions(discord.Object(id=int(lid)), overwrite=None)
-                    except discord.HTTPException:
-                        pass
-                    except Exception:
-                        pass
-            for lid in leaver_ids:
-                m = await self.get_member_safe(guild, int(lid))
-                if m is not None:
-                    alive_role = guild.get_role(self.alive_role_id) if self.alive_role_id else None
-                    if alive_role and alive_role in m.roles:
-                        try:
-                            await m.remove_roles(alive_role)
-                        except discord.HTTPException:
-                            pass
-                    await self.reconcile_member_discord_roles(guild, m)
-            if self.in_progress and not self.ending:
-                try:
-                    await self.check_win_conditions()
-                except Exception:
-                    logging.exception(
-                        "check_win after leaver rehydrate failed guild_id=%s",
-                        self.guild_id,
-                    )
+        from types import SimpleNamespace
+        from gameplay.state import commit
+        from gameplay.death import apply_death
+        player_ids = list(getattr(self, '_persist_player_ids', []))
+        dead_ids = self._graveyard_player_ids()
+        living_ids = [pid for pid in getattr(self, '_persist_living_ids', []) if pid not in dead_ids]
+        found = {pid: await self.lookup_member(guild, pid) for pid in player_ids}
+        departed = [pid for pid in living_ids if found.get(pid) is None]
+        placeholders = {pid: SimpleNamespace(id=pid, display_name=f'Player {pid}', mention=f'<@{pid}>', roles=[])
+                        for pid in player_ids if found[pid] is None}
+        expected = self.game_key
+        def hydrate():
+            if self.game_key != expected or self.ending:
+                return
+            self.players = [found[pid] or placeholders[pid] for pid in player_ids]
+            self.living_players = [found.get(pid) or placeholders[pid] for pid in living_ids if pid in found]
+            for pid in departed:
+                if self.in_progress:
+                    apply_death(self, pid, 'left')
+            self._rehydrate_pending = False
+            self._persist_player_ids = []
+            self._persist_living_ids = []
+        await commit(self, hydrate, persist=bool(departed) and self.in_progress, allow_recovery=True)
+        if departed and self.in_progress and not self.ending and not self._recovering_permissions:
+            for pid in departed:
+                receipt = self.gameplay['deaths'].get(str(pid))
+                if receipt:
+                    await self.deliver_death_receipt(None, guild, receipt)
 
     async def _sweep_executioner_conversion_for(
         self,
@@ -812,30 +782,36 @@ class Game:
                 return None
         return member
 
-    async def ensure_rehydrated(self, guild: discord.Guild) -> None:
-        """Load Discord members after lazy ``get_game_for_guild`` disk restore."""
-        if getattr(self, "_rehydrate_pending", False) or hasattr(self, "_persist_player_ids"):
-            await self.rehydrate_members(guild)
-            self._rehydrate_pending = False
+    async def ensure_rehydrated(self, guild) -> None:
+        async with self._rehydrate_lock:
+            if self._rehydrate_pending:
+                await self.rehydrate_members(guild)
 
     async def sync_living_players(self, guild):
         if guild is None:
-            return
+            raise MemberLookupUnavailable('The game server is unavailable.')
+        await self.ensure_rehydrated(guild)
         from gameplay.state import commit
+        from gameplay.death import apply_death
         expected = (self.game_key, self.day_number)
-        candidates = list(self.living_players)
-        members = {}
-        for player in candidates:
-            member = await self.get_member_safe(guild, player.id)
-            if member:
-                members[player.id] = member
+        dead_ids = self._graveyard_player_ids()
+        candidates = [p for p in self.living_players if p.id not in dead_ids]
+        members = {p.id: await self.lookup_member(guild, p.id) for p in candidates}
+        departed = [uid for uid, member in members.items() if member is None]
         def refresh():
             if expected != (self.game_key, self.day_number) or self.ending:
                 return
-            dead = {int(e['player_id']) for e in self.graveyard if isinstance(e, dict) and str(e.get('player_id', '')).isdigit()}
-            self.living_players = sorted([members[p.id] for p in self.living_players if p.id in members and p.id not in dead],
+            for uid in departed:
+                if self.in_progress:
+                    apply_death(self, uid, 'left')
+            current_dead = self._graveyard_player_ids()
+            self.living_players = sorted([members.get(p.id) or p for p in self.living_players if p.id not in current_dead],
                 key=lambda m: (self.player_slots.get(m.id, 10**9), m.display_name.lower()))
-        await commit(self, refresh, persist=False)
+        await commit(self, refresh, persist=bool(departed) and self.in_progress)
+        for uid in departed:
+            receipt = self.gameplay['deaths'].get(str(uid))
+            if receipt:
+                await self.deliver_death_receipt(None, guild, receipt)
 
     def _engine_player_ids(self) -> Set[int]:
         ids: Set[int] = set()
@@ -988,15 +964,10 @@ class Game:
             playing_role = guild.get_role(PLAYING_ROLE_ID)
             overseer_role = guild.get_role(GAME_OVERSEER_ROLE_ID)
 
-            grave_overwrites = {
-                guild.default_role: discord.PermissionOverwrite(view_channel=False),
-                alive_role: discord.PermissionOverwrite(view_channel=False),
-            }
-
-            mafia_overwrites = {
-                guild.default_role: discord.PermissionOverwrite(view_channel=False),
-                alive_role: discord.PermissionOverwrite(view_channel=False),
-            }
+            from gameplay.access import private_overwrites as build_private_overwrites
+            private_overwrites = build_private_overwrites(guild, alive_role)
+            grave_overwrites = dict(private_overwrites)
+            mafia_overwrites = dict(private_overwrites)
 
             for name, attr, creator in [
                 (
@@ -1043,19 +1014,9 @@ class Game:
             for ch in [mafia_tc, graveyard_tc, graveyard_vc]:
                 if not ch:
                     continue
-                try:
-                    await ch.set_permissions(guild.default_role, view_channel=False)
-                except discord.HTTPException:
-                    logging.warning("Failed to hide private channel from @everyone.", exc_info=True)
-                try:
-                    await ch.set_permissions(alive_role, view_channel=False)
-                except discord.HTTPException:
-                    logging.warning("Failed to hide private channel from Alive role.", exc_info=True)
-                if playing_role:
-                    try:
-                        await ch.set_permissions(playing_role, view_channel=False)
-                    except discord.HTTPException:
-                        logging.warning("Failed to hide private channel from Playing role.", exc_info=True)
+                # Replace the complete ACL atomically, removing stale member and role allows.
+                # Do not publish any private content if normalization fails.
+                await ch.edit(overwrites=dict(private_overwrites), reason='Reconcile game-channel privacy')
 
             # Category-based access model:
             # - Everyone in game gets "Playing"
@@ -1170,6 +1131,7 @@ class Game:
                 db.enqueue_or_requeue_dm_outbox(
                     guild_id=self.guild_id,
                     kind="game_over",
+                    match_key=self.game_key,
                     dedupe_key=f"mafia_game_over:{self.guild_id}:{gk}:{player.id}",
                     target_user_id=player.id,
                     content="--- GAME OVER ---\nThe game has ended.",
@@ -1183,7 +1145,8 @@ class Game:
         bot = try_get_bot()
         db = getattr(bot, "db", None) if bot is not None else None
         if db:
-            self._enqueue_game_over_dms()
+            from async_work import run_blocking
+            await run_blocking(self._enqueue_game_over_dms)
         elif bot is not None:
             for player in list(self.players):
                 try:
@@ -1268,7 +1231,8 @@ class Game:
             except discord.HTTPException:
                 pass
 
-        commit_and_maybe_delete_game_state(self.guild_id)
+        from async_work import run_blocking
+        await run_blocking(commit_and_maybe_delete_game_state, self.guild_id)
 
         # (Already marked ended at the start of reset.)
         self.phase = None
@@ -1322,7 +1286,8 @@ class Game:
         bot = try_get_bot()
         db = getattr(bot, "db", None) if bot is not None else None
         if db:
-            self._enqueue_game_over_dms()
+            from async_work import run_blocking
+            await run_blocking(self._enqueue_game_over_dms)
         elif bot is not None:
             for player in list(self.players):
                 try:
@@ -1409,7 +1374,8 @@ class Game:
             except discord.HTTPException:
                 pass
 
-        commit_and_maybe_delete_game_state(self.guild_id)
+        from async_work import run_blocking
+        await run_blocking(commit_and_maybe_delete_game_state, self.guild_id)
 
         self.in_progress = False
         self.phase = None
@@ -2038,7 +2004,8 @@ class Game:
                         self.guild_id,
                         getattr(self, "game_key", None),
                     )
-                    self._enqueue_game_over_dms()
+                    from async_work import run_blocking
+                    await run_blocking(self._enqueue_game_over_dms)
                     self.in_progress = False
                     self.ending = True
                     self.cleanup_pending = True
@@ -2524,80 +2491,119 @@ class Game:
 
     async def deliver_death_receipt(self, channel, guild, receipt, member=None) -> None:
         uid = str(receipt['player_id'])
-        async with self.delivery_locks.setdefault(uid, asyncio.Lock()):
-            current = self.gameplay['deaths'].get(uid)
-            if current:
-                await self._deliver_death_receipt(channel, guild, current, member)
+        from gameplay.lifecycle import message_lock
+        try:
+            async with self.delivery_locks.setdefault(uid, asyncio.Lock()):
+                async with message_lock(self.guild_id):
+                    current = self.gameplay['deaths'].get(uid)
+                    if current and not self.ending and active_games.get(self.guild_id) in (None, self):
+                        await self._deliver_death_receipt(channel, guild, current, member)
+        finally:
+            controller = getattr(try_get_bot(), 'gameplay_controller', None)
+            if controller and active_games.get(self.guild_id) is self and self.in_progress and not self.ending:
+                controller.retry_death(self, int(uid))
 
     async def _deliver_death_receipt(self, channel, guild, receipt, member=None) -> None:
+        from async_work import finish_pending
         from gameplay.death import death_text
         from gameplay.state import commit, Rejected
-        if receipt.get("delivered"):
+        if receipt.get('delivered'):
             return
         if getattr(guild, '_monte_carlo_fake', False):
             receipt['delivered'] = True
             return
-        member = member or await self.get_member_safe(guild, receipt["player_id"])
-        ok = True
-        if not receipt.get("announcement_id"):
-            message = None
-            marker = f"-# Game event: {receipt.get('notice_id', '')}"
-            destination = getattr(channel, "channel", channel)
-            if receipt.get("notice_id") and hasattr(destination, "history"):
-                async for candidate in destination.history(limit=100):
-                    if marker in candidate.content and candidate.author.id == getattr(getattr(_BOT, 'user', None), 'id', None):
-                        message = candidate
-                        break
-            if message is None:
-                message = await channel.send(death_text(receipt) + ("\n" + marker if receipt.get('notice_id') else ""), allowed_mentions=discord.AllowedMentions.none())
-            def announced():
-                if active_games.get(self.guild_id) not in (None, self) or self.ending:
-                    raise Rejected("This game has ended.")
-                receipt["announcement_id"] = getattr(message, "id", None)
-            await commit(self, announced, persist=self.in_progress and not self.ending)
-        if member:
-            alive = guild.get_role(self.alive_role_id) if self.alive_role_id else None
-            try:
+        match = self.game_key
+        def current():
+            if self.game_key != match or self.ending or active_games.get(self.guild_id) not in (None, self):
+                raise Rejected('This game has ended.')
+        def checkpoint(**changes):
+            current()
+            self.gameplay['deaths'][str(receipt['player_id'])].update(changes)
+        member = member or await self.lookup_member(guild, receipt['player_id'])
+        member = member or next((p for p in self.players if p.id == receipt['player_id'] and isinstance(p, discord.Member)), None)
+        current()
+        # Security cleanup precedes and is independent of public delivery.
+        if not receipt.get('access_cleaned'):
+            ok = True
+            if member:
+                alive = guild.get_role(self.alive_role_id) if self.alive_role_id else None
                 if alive and alive in member.roles:
-                    await member.remove_roles(alive)
+                    try:
+                        await finish_pending(member.remove_roles(alive))
+                    except discord.NotFound:
+                        pass
+                    except discord.HTTPException:
+                        ok = False
+                    current()
+            mafia = guild.get_channel(self.mafia_tc_id) if self.mafia_tc_id else None
+            if mafia:
+                try:
+                    if member:
+                        await finish_pending(mafia.set_permissions(member, overwrite=None))
+                    else:
+                        # Delete by snowflake even when the departed member is no longer cached.
+                        await finish_pending(mafia._state.http.delete_channel_permissions(mafia.id, receipt['player_id']))
+                except discord.NotFound:
+                    pass
+                except discord.HTTPException:
+                    ok = False
+                current()
+            if member:
                 for cid in (self.grave_tc_id, self.grave_vc_id):
                     ch = guild.get_channel(cid) if cid else None
                     if ch:
-                        if cid == self.grave_tc_id:
-                            await ch.set_permissions(member, view_channel=True, send_messages=True)
-                        else:
-                            await ch.set_permissions(member, view_channel=True, connect=True, speak=True)
-                            if getattr(member, "voice", None) and member.voice.channel:
-                                await member.move_to(ch)
-                mafia = guild.get_channel(self.mafia_tc_id) if self.mafia_tc_id else None
-                if mafia:
-                    await mafia.set_permissions(member, overwrite=None)
+                        try:
+                            if cid == self.grave_tc_id:
+                                await finish_pending(ch.set_permissions(member, view_channel=True, send_messages=True))
+                            else:
+                                await finish_pending(ch.set_permissions(member, view_channel=True, connect=True, speak=True))
+                                if getattr(member, 'voice', None) and member.voice.channel:
+                                    await finish_pending(member.move_to(ch))
+                        except discord.HTTPException:
+                            ok = False
+                        current()
+            await commit(self, lambda: checkpoint(access_cleaned=ok), persist=self.in_progress)
+        if channel and not receipt.get('announcement_id'):
+            message = None
+            marker = f"-# Game event: {receipt.get('notice_id', '')}"
+            destination = getattr(channel, 'channel', channel)
+            try:
+                if receipt.get('notice_id') and hasattr(destination, 'history'):
+                    try:
+                        async for candidate in destination.history(limit=100):
+                            if marker in candidate.content and candidate.author.id == getattr(getattr(_BOT, 'user', None), 'id', None):
+                                message = candidate
+                                break
+                    except discord.HTTPException:
+                        pass  # Sending may still work without Read Message History.
+                current()
+                if message is None:
+                    message = await finish_pending(channel.send(death_text(receipt) + ('\n' + marker if receipt.get('notice_id') else ''),
+                        allowed_mentions=discord.AllowedMentions.none()))
+                await commit(self, lambda: checkpoint(announcement_id=getattr(message, 'id', None)), persist=self.in_progress)
             except discord.HTTPException:
-                ok = False
-            if receipt["real_role"] == "Jester" and receipt["cause"] == "lynch" and receipt["voters"]:
-                eligible = []
-                for uid in receipt["voters"]:
-                    voter = await self.get_member_safe(guild, uid)
-                    if voter:
-                        eligible.append(f"#{self.player_slots.get(uid, '?')}: {voter.display_name}")
+                pass  # The saved receipt is retried separately from access cleanup.
+        if not receipt.get('notices_delivered'):
+            if member and receipt['real_role'] == 'Jester' and receipt['cause'] == 'lynch' and receipt['voters']:
+                eligible = [f"#{self.player_slots.get(uid, '?')}: {p.display_name}" for uid in receipt['voters']
+                            for p in self.players if p.id == uid]
                 try:
-                    await member.send("You have been successfully lynched! You win!\n"
-                                      "Choose a Guilty or abstaining voter to haunt:\n" +
-                                      "\n".join(eligible) + "\nUse /actions tonight, or !haunt to view the command's eligible voter numbers.")
+                    await member.send('You have been successfully lynched! You win!\nChoose a Guilty or abstaining voter to haunt:\n' +
+                                      '\n'.join(eligible) + '\nUse /actions tonight, or !haunt for eligible numbers.')
                 except discord.HTTPException:
                     pass
-        for uid in receipt.get("converted", []):
-            converted = await self.get_member_safe(guild, uid)
-            if converted:
-                try:
-                    await converted.send("Your target has died. You have failed your goal and become a Jester.")
-                except discord.HTTPException:
-                    pass
-        def delivered():
-            if active_games.get(self.guild_id) not in (None, self) or self.ending:
-                raise Rejected("This game has ended.")
-            self.gameplay["deaths"][str(receipt['player_id'])]["delivered"] = ok
-        await commit(self, delivered, persist=self.in_progress and not self.ending)
+                current()
+            for uid in receipt.get('converted', []):
+                converted = await self.get_member_safe(guild, uid)
+                if converted:
+                    try:
+                        await converted.send('Your target has died. You have failed your goal and become a Jester.')
+                    except discord.HTTPException:
+                        pass
+                current()
+            await commit(self, lambda: checkpoint(notices_delivered=True), persist=self.in_progress)
+        await commit(self, lambda: checkpoint(delivered=bool(receipt.get('access_cleaned') and receipt.get('announcement_id'))),
+            persist=self.in_progress)
 
     async def start_night(self, ctx, *, trial_token=None):
         from gameplay.integration import start_night

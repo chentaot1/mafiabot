@@ -24,6 +24,7 @@ from gameplay.controller import Controller
 from gameplay.views import private_reply, NO_MENTIONS
 from database import Database
 from instance_lock import acquire_instance_lock
+from async_work import run_blocking, finish_pending
 import game_roles
 from config import role_starting_charges, chaos_starting_uses, guardian_angel_bind_pool_ids
 from config import (
@@ -225,6 +226,7 @@ async def _gateway_stuck_watchdog() -> None:
                         stale,
                         disconnect_sec,
                     )
+                    bot._gateway_restart_requested = True
                     try:
                         await bot.close()
                     except Exception:
@@ -250,6 +252,7 @@ async def _gateway_stuck_watchdog() -> None:
                         boot_stale,
                         initial_sec,
                     )
+                    bot._gateway_restart_requested = True
                     try:
                         await bot.close()
                     except Exception:
@@ -271,32 +274,60 @@ async def _gateway_stuck_watchdog() -> None:
         raise
 
 
+def _outbox_match_key(row):
+    if row.get('match_key'):
+        return row['match_key']
+    key = str(row.get('dedupe_key') or '')
+    # Compatibility with the existing mafia_kind:guild:match:user format.
+    if key.startswith('mafia_') and key.count(':') >= 3:
+        return key.rsplit(':', 1)[0].split(':', 2)[2]
+    return None
+
+
 async def _dm_outbox_pump_loop() -> None:
-    """Drain SQLite-backed DM queue (B6.1)."""
+    """Drain queued messages off the event loop and validate their match at delivery."""
+    from gameplay.lifecycle import message_lock
     await bot.wait_until_ready()
     while not bot.is_closed():
         try:
-            db = getattr(bot, "db", None)
+            db = getattr(bot, 'db', None)
             if db:
-                db.requeue_stale_dm_outbox_sending(stale_after_seconds=300)
-                rows = db.claim_dm_outbox_batch(limit=25)
+                await run_blocking(db.requeue_stale_dm_outbox_sending, stale_after_seconds=300)
+                rows = await run_blocking(db.claim_dm_outbox_batch, limit=25)
                 for row in rows:
-                    mid = int(row["id"])
-                    uid = int(row["target_user_id"])
-                    content = str(row["content"])
+                    mid, uid, gid = int(row['id']), int(row['target_user_id']), int(row['guild_id'])
                     try:
                         user = bot.get_user(uid) or await bot.fetch_user(uid)
-                        await user.send(content)
-                        db.mark_dm_outbox_sent(mid)
-                    except discord.HTTPException as e:
-                        delay = 120
-                        if e.status == 429:
-                            delay = min(600, int(getattr(e, "retry_after", 60) or 60) + 5)
-                        db.retry_dm_outbox_later(mid, error=str(e), delay_seconds=delay)
-                    except Exception as e:
-                        db.retry_dm_outbox_later(mid, error=str(e), delay_seconds=90)
+                        async with message_lock(gid):
+                            match = _outbox_match_key(row)
+                            current = active_games.get(gid)
+                            if match and current is None:
+                                # READY may still be recovering the saved game. Check
+                                # its identity before even sending a Game Over notice.
+                                data = await run_blocking(load_state, gid)
+                                if data and data.get('in_progress'):
+                                    if data.get('game_key') != match:
+                                        await run_blocking(db.mark_dm_outbox_superseded, mid)
+                                        continue
+                                    if row['kind'] != 'game_over':
+                                        await run_blocking(db.defer_dm_outbox, mid)
+                                        continue
+                            obsolete = bool(match and (
+                                (current is not None and current.game_key not in (None, match)) or
+                                (row['kind'] != 'game_over' and (current is None or not current.in_progress
+                                    or current.ending or current.game_key != match))))
+                            if obsolete:
+                                await run_blocking(db.mark_dm_outbox_superseded, mid)
+                                continue
+                            await finish_pending(user.send(str(row['content'])))
+                            await run_blocking(db.mark_dm_outbox_sent, mid)
+                    except discord.HTTPException as error:
+                        delay = min(600, int(getattr(error, 'retry_after', 60) or 60) + 5) if error.status == 429 else 120
+                        await run_blocking(db.retry_dm_outbox_later, mid, error=type(error).__name__, delay_seconds=delay)
+                    except Exception as error:
+                        await run_blocking(db.retry_dm_outbox_later, mid, error=type(error).__name__, delay_seconds=90)
         except Exception:
-            logging.exception("dm_outbox pump iteration failed")
+            logging.exception('dm_outbox pump iteration failed')
         await asyncio.sleep(12)
 
 
@@ -397,6 +428,8 @@ class WillModal(discord.ui.Modal, title="Edit your Last Will"):
                 raise gameplay_state.Rejected("This editor belongs to an earlier game. Open !will again.")
             if game.resolving:
                 raise gameplay_state.Rejected("Night is resolving. Please wait.")
+            if self.owner_id not in {p.id for p in game.living_players}:
+                raise gameplay_state.Rejected("Only living players can edit their wills.")
             game.role_states.setdefault(interaction.user.id, {})["will"] = str(self.will.value or "")[:1800]
         try:
             await gameplay_state.commit(game, save)
@@ -424,6 +457,8 @@ class WillView(discord.ui.View):
             gameplay_state.require_current(game)
             if game.game_key != self.match_key:
                 raise gameplay_state.Rejected("This editor belongs to an earlier game. Open !will again.")
+            if self.owner_id not in {p.id for p in game.living_players}:
+                raise gameplay_state.Rejected('Only living players can edit their wills.')
         except gameplay_state.Rejected as error:
             return await private_reply(interaction, str(error))
         latest = str(game.role_states.get(interaction.user.id, {}).get("will", "") or "")
@@ -603,9 +638,10 @@ async def on_ready() -> None:
         try:
             db_path = str(persistence.STATE_DIR / "mafiabot.db")
             bot.db = Database(db_path)  # type: ignore[attr-defined]
-            bot.db.initialize()  # type: ignore[attr-defined]
+            await run_blocking(bot.db.initialize)  # type: ignore[attr-defined]
         except Exception:
             logging.exception("Failed to initialize SQLite DB (leaderboards disabled).")
+            bot.db = None
 
     bot._gateway_had_ready = True  # type: ignore[attr-defined]
     bot._gateway_disconnect_at = None  # type: ignore[attr-defined]
@@ -613,19 +649,41 @@ async def on_ready() -> None:
 
     if not getattr(bot, "_mafia_dm_outbox_started", False):
         bot._mafia_dm_outbox_started = True  # type: ignore[attr-defined]
-        bot.loop.create_task(_dm_outbox_pump_loop())
+        bot._mafia_dm_outbox_task = asyncio.create_task(_dm_outbox_pump_loop())
 
-    # Attempt to restore persisted game state for the allowed guild.
     guild = bot.get_guild(ALLOWED_GUILD_ID)
+    try:
+        await _restore_saved_game(guild)
+    except (OSError, discord.HTTPException):
+        logging.exception('Saved game recovery pending; retaining the snapshot.')
+        bot.gameplay_controller.start_job((ALLOWED_GUILD_ID, 'restore', 'current'), lambda: _restore_saved_game(guild))
+
+
+async def _restore_saved_game(guild):
+    from gameplay.lifecycle import recovery_lock
+    async with recovery_lock(ALLOWED_GUILD_ID):
+        await _restore_saved_game_locked(guild)
+
+
+async def _restore_saved_game_locked(guild):
+    # Attempt to restore persisted game state for the allowed guild.
     if guild:
         # READY can fire again while trial/duel/resolution tasks are running.
         # Those tasks and new commands must keep the same Game object.
-        if getattr(bot, "_mafia_state_restore_started", False) or ALLOWED_GUILD_ID in active_games:
+        if (ALLOWED_GUILD_ID in active_games and not active_games[ALLOWED_GUILD_ID]._rehydrate_pending
+                and not active_games[ALLOWED_GUILD_ID]._recovering_permissions
+                and not getattr(bot, "_mafia_full_reconnect", False)):
             logging.info("Preserving live game state on READY for guild %s.", ALLOWED_GUILD_ID)
             return
         # Set before the first await to prevent overlapping READY restores.
         bot._mafia_state_restore_started = True
-        data = load_state(ALLOWED_GUILD_ID)
+        existing = active_games.get(ALLOWED_GUILD_ID)
+        data = existing.to_persisted() if existing else await run_blocking(load_state, ALLOWED_GUILD_ID)
+        # A command may have restored the game while the disk read was pending.
+        # Always hydrate the canonical object from its own snapshot.
+        existing = active_games.get(ALLOWED_GUILD_ID)
+        if existing:
+            data = existing.to_persisted()
         _dbg(
             "H5",
             "bot.py:on_ready:restore:pre",
@@ -634,51 +692,32 @@ async def on_ready() -> None:
         )
         if data:
             try:
-                game = Game.from_persisted(data)
-                await game.rehydrate_members(guild)
+                game = existing or Game.from_persisted(data)
+                if not game._rehydrate_pending:
+                    game._persist_player_ids = list(data.get('player_ids', []))
+                    game._persist_living_ids = list(data.get('living_ids', []))
+                game._rehydrate_pending = True
+                game._recovering_permissions = game.in_progress
+                active_games[ALLOWED_GUILD_ID] = game
+                await game.ensure_rehydrated(guild)
                 # Do not publish a half-rehydrated game or replace one that
                 # commands created while member fetching was in progress.
-                if ALLOWED_GUILD_ID in active_games:
-                    logging.info("Preserving game created during startup recovery.")
+                if active_games.get(ALLOWED_GUILD_ID) is not game or game.ending:
                     return
-                active_games[ALLOWED_GUILD_ID] = game
                 logging.info(f"Restored persisted game state for guild {ALLOWED_GUILD_ID}.")
 
 
-                # Best-effort repair: ensure Playing/Lockdown roles are applied consistently after restart.
-                playing_role = guild.get_role(PLAYING_ROLE_ID)
-                lockdown_role = guild.get_role(game.lockdown_role_id) if getattr(game, "lockdown_role_id", None) else None
-                if game.in_progress and playing_role:
-                    for p in list(game.players):
-                        try:
-                            if playing_role not in p.roles:
-                                await p.add_roles(playing_role)
-                        except discord.HTTPException as e:
-                            logging.warning(
-                                "Playing role repair failed guild_id=%s member_id=%s role_id=%s: %s",
-                                guild.id,
-                                getattr(p, "id", None),
-                                getattr(playing_role, "id", None),
-                                e,
-                            )
-                        await asyncio.sleep(0.05)
-                if game.in_progress and lockdown_role:
-                    for p in list(game.players):
-                        try:
-                            if any(r.id == GAME_OVERSEER_ROLE_ID for r in p.roles) or p.guild_permissions.administrator:
-                                continue
-                            if lockdown_role not in p.roles:
-                                await p.add_roles(lockdown_role)
-                        except discord.HTTPException as e:
-                            logging.warning(
-                                "Lockdown role repair failed guild_id=%s member_id=%s role_id=%s: %s",
-                                guild.id,
-                                getattr(p, "id", None),
-                                getattr(lockdown_role, "id", None),
-                                e,
-                            )
-                        await asyncio.sleep(0.05)
+                if game.in_progress:
+                    from gameplay.access import reconcile
+                    async with game._startup_lock:
+                        def guard():
+                            if active_games.get(game.guild_id) is not game or game.ending:
+                                raise gameplay_state.Rejected('This recovery was cancelled.')
+                        await reconcile(game, guild, guard)
+                        guard()
+                        game._recovering_permissions = False
 
+                bot._mafia_full_reconnect = False
                 if game.in_progress:
                     await bot.gameplay_controller.recover(game)
                 if game.gameplay.get("trial"):
@@ -757,7 +796,7 @@ async def on_ready() -> None:
                                 e,
                             )
             except Exception:
-                logging.exception("Failed to restore persisted state; starting fresh.")
+                raise
     else:
         _dbg(
             "H5",
@@ -814,7 +853,11 @@ async def on_message(message: discord.Message) -> None:
 # ==========================================
 @bot.check
 async def enforce_allowed_guild_check(ctx: commands.Context) -> bool:
-    return await enforce_allowed_guild(ctx, allowed_guild_id=ALLOWED_GUILD_ID)
+    allowed = await enforce_allowed_guild(ctx, allowed_guild_id=ALLOWED_GUILD_ID)
+    if allowed and ctx.guild:
+        game = get_game_for_guild(ctx.guild.id, allowed_guild_id=ALLOWED_GUILD_ID)
+        await game.ensure_rehydrated(ctx.guild)
+    return allowed
 
 
 @bot.event
@@ -892,13 +935,15 @@ async def show_players_command(ctx: commands.Context) -> None:
     if not game.players:
         return await ctx.send("No one has joined yet. Use `!join` to enter.")
 
-    player_mentions = [p.mention for p in game.players]
-    living_mentions = [p.mention for p in game.living_players]
+    player_mentions = [f'#{game.player_slots.get(p.id, index)}: {p.mention}' for index, p in enumerate(game.players, 1)]
+    living_mentions = [f'#{game.player_slots.get(p.id, index)}: {p.mention}' for index, p in enumerate(game.living_players, 1)]
 
     response = f"**Waiting Players ({len(game.players)}):**\n" + ", ".join(player_mentions)
     if game.living_players:
         response += f"\n\n**Living Players ({len(game.living_players)}):**\n" + ", ".join(living_mentions)
-    await ctx.send(response)
+    from discord_output import chunk_lines
+    for chunk in chunk_lines(response.splitlines(), max_chars=1900):
+        await ctx.send(chunk, allowed_mentions=NO_MENTIONS)
 
 
 @bot.command(name='startgame')
@@ -907,31 +952,35 @@ async def show_players_command(ctx: commands.Context) -> None:
 @commands.check(enforce_allowed_guild_check)
 async def startgame(ctx: commands.Context) -> None:
     game = get_game_for_guild(ctx.guild.id, allowed_guild_id=ALLOWED_GUILD_ID)
-    async with game._startup_lock:
-        try:
-            await _startgame(ctx, game)
-        except gameplay_state.Rejected as error:
-            await ctx.send(str(error))
+    try:
+        await _startgame(ctx, game)
+    except gameplay_state.Rejected as error:
+        await ctx.send(str(error))
 
 
 async def _startgame(ctx, game):
-    if game.in_progress:
-        return await ctx.send("A game is already in progress!")
+    async with game._startup_lock:
+        await _startgame_impl(ctx, game)
+
+
+async def _startgame_impl(ctx, game):
+    if game.in_progress or game.ending:
+        return await ctx.send("A game is already in progress or being cleaned up!")
 
     # Keep recovered endgame markers until their statistics are committed;
     # starting a new match must not overwrite the previous match's snapshot.
     from game_recovery import _pending_endgame_meta, disk_recovery_blocked_reason
-    if _pending_endgame_meta(game.guild_id):
-        if not Game.commit_pending_endgame_if_any(game.guild_id):
+    if await run_blocking(_pending_endgame_meta, game.guild_id):
+        if not await run_blocking(Game.commit_pending_endgame_if_any, game.guild_id):
             return await ctx.send('Previous match statistics are pending. Repair or retry recovery before starting a new game.')
-    blocked = disk_recovery_blocked_reason(game.guild_id)
+    blocked = await run_blocking(disk_recovery_blocked_reason, game.guild_id)
     if blocked:
         return await ctx.send(blocked)
 
     expected_roster = tuple(p.id for p in game.players)
     valid_players = []
     for p in game.players:
-        member = await game.get_member_safe(ctx.guild, p.id)
+        member = await game.lookup_member(ctx.guild, p.id)
         if member:
             valid_players.append(member)
 
@@ -1028,7 +1077,8 @@ async def _startgame(ctx, game):
         game.graveyard = []
         game.night_actions, game.role_states, game.doused_players = {}, {}, set()
 
-        game.gameplay = {"version": 1, "trial": None, "panels": {}, "night_token": None, "deaths": {}}
+        game.gameplay = {"version": 1, "trial": None, "panels": {}, "night_token": None, "deaths": {}, "duels": {}, "resolutions": {},
+            "startup": {"match": game.game_key, "complete": False, "announced": False, "completed_players": []}}
         for p_id, role in game.player_roles.items():
             state: Dict = {}
             if role == "Vigilante":    state = {"shots_remaining": 1, "will_die_of_guilt": False, "guilty_tomorrow": False}
@@ -1072,110 +1122,19 @@ async def _startgame(ctx, game):
                 pool = guardian_angel_bind_pool_ids([p.id for p in game.players], ga_id)
                 if pool:
                     game.role_states[ga_id]["ga_target_id"] = int(random.choice(pool))
-    await gameplay_state.commit(game, initialize_game)
-    alive_role = ctx.guild.get_role(game.alive_role_id) if game.alive_role_id else None
-    playing_role = ctx.guild.get_role(PLAYING_ROLE_ID)
-    lockdown_role = ctx.guild.get_role(game.lockdown_role_id) if getattr(game, "lockdown_role_id", None) else None
-
-    for p_id, role in game.player_roles.items():
-        player = await game.get_member_safe(ctx.guild, p_id)
-        if not player:
-            continue
-
-        if alive_role:
-            try:
-                await player.add_roles(alive_role)
-            except discord.HTTPException:
-                pass
-        # Everyone in the game gets Playing (including GM/admin).
-        if playing_role:
-            try:
-                await player.add_roles(playing_role)
-            except discord.HTTPException:
-                pass
-
-        # Only non-staff get the lockdown role (so staff can still play without losing access).
-        if lockdown_role:
-            if any(r.id == GAME_OVERSEER_ROLE_ID for r in player.roles) or player.guild_permissions.administrator:
-                pass
-            else:
-                try:
-                    await player.add_roles(lockdown_role)
-                except discord.HTTPException:
-                    pass
-
-    # Role state was committed before Discord delivery; outbox entries are deduplicated.
-
-    db = getattr(bot, "db", None)
-    for p_id, role in game.player_roles.items():
-        player = await game.get_member_safe(ctx.guild, p_id)
-        if not player:
-            continue
-        state = game.role_states.get(p_id, {}) or {}
-        if db:
-            db.enqueue_dm_outbox(
-                guild_id=ctx.guild.id,
-                kind="role_deal",
-                dedupe_key=f"mafia_role_deal:{ctx.guild.id}:{game.game_key}:{p_id}",
-                target_user_id=p_id,
-                content=(
-                    f"--- GAME STARTED ---\nYour role is: **{role}**\n"
-                    f"Use `!myrole` at any time to see your role's description and abilities."
-                ),
-            )
-            if role == "Executioner" and state.get("exe_target"):
-                target_user = ctx.guild.get_member(state["exe_target"])
-                if target_user:
-                    db.enqueue_dm_outbox(
-                        guild_id=ctx.guild.id,
-                        kind="exe_target",
-                        dedupe_key=f"mafia_exe_target:{ctx.guild.id}:{game.game_key}:{p_id}",
-                        target_user_id=p_id,
-                        content=(
-                            f"Your target is **{target_user.display_name}**. "
-                            f"You must convince the Town to lynch them to win."
-                        ),
-                    )
-        else:
-            try:
-                await player.send(
-                    f"--- GAME STARTED ---\nYour role is: **{role}**\n"
-                    f"Use `!myrole` at any time to see your role's description and abilities."
-                )
-                if role == "Executioner" and state.get("exe_target"):
-                    target_user = ctx.guild.get_member(state["exe_target"])
-                    if target_user:
-                        await player.send(
-                            f"Your target is **{target_user.display_name}**. You must convince the Town to lynch them to win."
-                        )
-            except discord.HTTPException:
-                await ctx.send(f"⚠️ Could not DM {player.mention} — they may have DMs disabled.")
-
-        from roles import role_start_dm_supplements
-        bind_slot = game.player_slots.get(state.get('ga_target_id'))
-        for kind, content in role_start_dm_supplements(role, bind_slot=bind_slot):
-            if db:
-                db.enqueue_dm_outbox(guild_id=ctx.guild.id, kind=kind,
-                    dedupe_key=f'mafia_{kind}:{ctx.guild.id}:{game.game_key}:{p_id}',
-                    target_user_id=p_id, content=content)
-            else:
-                try:
-                    await player.send(content)
-                except discord.HTTPException:
-                    await ctx.send(f'Could not deliver role instructions to {player.mention}.')
-
-    await ctx.send(f"**Game Started!** Roles have been assigned secretly. It is now **Day 1**.")
-    logging.info(f"Game started on guild {ctx.guild.id} with {player_count} players.")
-
-    mafia_tc = ctx.guild.get_channel(game.mafia_tc_id)
-    if mafia_tc:
-        for p in game.players:
-            if game.player_roles.get(p.id) in ALL_MAFIA_ROLES:
-                try:
-                    await mafia_tc.set_permissions(p, view_channel=True, send_messages=True)
-                except discord.HTTPException:
-                    pass
-        await mafia_tc.send("Welcome, Mafiosi. This is your private channel.")
+    from gameplay.lifecycle import message_lock
+    from gameplay import startup
+    async with message_lock(game.guild_id):
+        await gameplay_state.commit(game, initialize_game)
+    try:
+        await startup.deliver(game, ctx.guild, client=bot)
+        await startup.announce(game, ctx.guild)
+    except (OSError, discord.HTTPException):
+        logging.warning('Startup delivery pending guild_id=%s', game.guild_id)
+        bot.gameplay_controller.start_job((game.guild_id, 'startup', game.game_key),
+            lambda: startup.resume(game, ctx.guild, client=bot))
+        await ctx.send('The role assignment is saved. Server setup is incomplete and will retry; gameplay opens when it finishes.')
+    logging.info('Game assigned on guild %s with %s players.', ctx.guild.id, player_count)
 
 
 @bot.command()
@@ -1251,16 +1210,21 @@ async def status(ctx: commands.Context) -> None:
             continue
         (acted if has_acted else waiting_for).append(f"- {player.display_name} ({role})")
 
-    embed = discord.Embed(title=f"🌙 Night {game.day_number} Status", color=discord.Color.blue())
-    embed.add_field(name="✅ Acted",       value="\n".join(acted)       or "None yet.", inline=False)
-    embed.add_field(name="⏳ Waiting For", value="\n".join(waiting_for) or "All in!",   inline=False)
-
+    from discord_output import section_embeds
+    embeds = section_embeds(f'🌙 Night {game.day_number} Status',
+        [('✅ Acted', acted or ['None yet.']), ('⏳ Waiting For', waiting_for or ['All in!'])], color=discord.Color.blue())
     try:
-        await ctx.author.send(embed=embed)
-        await ctx.message.delete()
-        await ctx.send("Night status sent to your DMs.", delete_after=5)
+        for embed in embeds:
+            await ctx.author.send(embed=embed, allowed_mentions=NO_MENTIONS)
+    except discord.Forbidden:
+        return await ctx.send("I can't DM you! Check your privacy settings.", delete_after=10)
     except discord.HTTPException:
-        await ctx.send("I can't DM you! Check your privacy settings.", delete_after=10)
+        return await ctx.send('Discord could not deliver the status. Please retry shortly.', delete_after=10)
+    try:
+        await ctx.message.delete()
+    except discord.HTTPException:
+        pass
+    await ctx.send('Night status sent to your DMs.', delete_after=5)
 
 
 @bot.command(name='slay')
@@ -1328,6 +1292,15 @@ class _ChanCtx:
         return await self.channel.send(*args, **kwargs)
 
 
+async def _cancel_legacy_tribunal_notice(channel) -> None:
+    """Best-effort notice: missing permissions may also prevent cancellation delivery."""
+    logging.warning("Legacy Tribunal cancelled because judgment controls were unavailable.")
+    try:
+        await channel.send("The trial has been cancelled because Discord could not deliver or read the judgment controls.")
+    except discord.HTTPException:
+        pass
+
+
 async def _complete_tribunal_after_defense(
     channel: discord.TextChannel,
     game: Game,
@@ -1374,12 +1347,13 @@ async def _complete_tribunal_after_defense(
         description="✅ — Guilty\n❌ — Innocent\n*(30 seconds)*",
         color=discord.Color.dark_red(),
     )
-    judgment_msg = await channel.send(embed=j_embed)
     try:
+        judgment_msg = await channel.send(embed=j_embed)
         await judgment_msg.add_reaction("✅")
         await judgment_msg.add_reaction("❌")
     except (discord.Forbidden, discord.HTTPException):
-        pass
+        await _cancel_legacy_tribunal_notice(channel)
+        return
 
     game.tribunal_judgment_message_id = judgment_msg.id
     await game.persist_flush()
@@ -1391,8 +1365,8 @@ async def _complete_tribunal_after_defense(
 
     try:
         judgment_msg = await channel.fetch_message(judgment_msg.id)
-    except discord.NotFound:
-        await channel.send("The judgment message was deleted — cancelling the trial.")
+    except discord.HTTPException:
+        await _cancel_legacy_tribunal_notice(channel)
         return
 
     await game.sync_living_players(guild)
@@ -1409,12 +1383,17 @@ async def _complete_tribunal_after_defense(
     user_reacts: Dict[int, Set[str]] = {}
     mayor_voted = False
 
-    for reaction in judgment_msg.reactions:
-        if str(reaction.emoji) not in {"✅", "❌"}:
-            continue
-        async for user in reaction.users():
-            if user.id != bot.user.id and user.id in living_ids and user.id != defendant.id:
-                user_reacts.setdefault(user.id, set()).add(str(reaction.emoji))
+    try:
+        for reaction in judgment_msg.reactions:
+            if str(reaction.emoji) not in {"✅", "❌"}:
+                continue
+            async for user in reaction.users():
+                if user.id != bot.user.id and user.id in living_ids and user.id != defendant.id:
+                    user_reacts.setdefault(user.id, set()).add(str(reaction.emoji))
+    except discord.HTTPException:
+        # Pagination can fail after some voters were read; never use a partial tally.
+        await _cancel_legacy_tribunal_notice(channel)
+        return
 
     resolved_judgments: Dict[int, Optional[str]] = {}
     for uid, reacts in user_reacts.items():
@@ -1637,8 +1616,15 @@ async def will(ctx: commands.Context, *, text: Optional[str] = None) -> None:
             gameplay_state.require_current(game)
             if game.resolving:
                 raise gameplay_state.Rejected("Night is resolving. Please wait.")
+            if ctx.author.id not in {p.id for p in game.living_players}:
+                raise gameplay_state.Rejected("Only living players can edit their wills.")
             game.role_states.setdefault(ctx.author.id, {})["will"] = ""
-        await gameplay_state.commit(game, clear)
+        try:
+            await gameplay_state.commit(game, clear)
+        except gameplay_state.Rejected as error:
+            return await ctx.author.send(str(error))
+        except OSError:
+            return await ctx.author.send('Your will could not be saved. Please try again.')
         return await ctx.author.send("Cleared your will.")
 
     current = str(state.get("will", "") or "")
@@ -1761,7 +1747,7 @@ async def stats(ctx: commands.Context, member: Optional[discord.Member] = None) 
 @commands.has_role(GAME_OVERSEER_ROLE_ID)
 @commands.guild_only()
 @commands.check(enforce_allowed_guild_check)
-async def importstats(ctx: commands.Context) -> None:
+async def importstats(ctx: commands.Context, force: Optional[str] = None) -> None:
     """
     One-time importer: migrate existing JSON stats to SQLite.
     This does NOT delete the JSON stats file.
@@ -1769,10 +1755,14 @@ async def importstats(ctx: commands.Context) -> None:
     db = getattr(bot, "db", None)
     if not db:
         return await ctx.send("SQLite DB not initialized; cannot import.")
-    data = load_stats(ctx.guild.id) or {}
+    if force is not None and force.lower() != 'force':
+        return await ctx.send('Use !importstats, or !importstats force to explicitly replace newer totals.')
+    data = await run_blocking(load_stats, ctx.guild.id) or {}
     n = 0
     try:
-        n = db.import_player_stats_from_json(guild_id=ctx.guild.id, stats_data=data)
+        n = await run_blocking(db.import_player_stats_from_json, guild_id=ctx.guild.id, stats_data=data, reject_stale=force is None)
+    except ValueError as error:
+        return await ctx.send(str(error))
     except Exception:
         logging.exception("Stats import failed.")
         return await ctx.send("🛑 Import failed — check logs.")
@@ -1896,7 +1886,7 @@ async def actions_command(ctx):
         await ctx.send("I couldn't deliver private controls. Enable DMs or use /actions.")
 
 
-@bot.tree.command(name="actions", description="Open your private night actions or outstanding duel")
+@bot.tree.command(name="actions", description="Open private role controls, report history, or an outstanding duel")
 async def actions_slash(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     game = get_game_by_player_id(interaction.user.id)
@@ -1969,6 +1959,9 @@ async def shoot(ctx: commands.Context, target_number: int) -> None:
         return await ctx.send('No active game found.')
     if game.phase == 'night':
         return await _vig_shoot_night(ctx, target_number)
+    expected = gameplay_state.identity(game)
+    if getattr(ctx, 'interaction', None) is not None:
+        await ctx.defer(ephemeral=True)
     from gameplay.deputy import fire
     from gameplay.controller import channel_is_private
     guild = ctx.guild or bot.get_guild(game.guild_id)
@@ -1981,9 +1974,14 @@ async def shoot(ctx: commands.Context, target_number: int) -> None:
             return await ctx.send('Use a verified private channel or DM for role actions.')
     target = next((uid for uid, slot in game.player_slots.items() if slot == target_number), None)
     try:
-        message, receipts = await fire(game, ctx.author.id, target, guild=guild)
+        message, receipts = await fire(game, ctx.author.id, target, guild=guild, expected=expected)
     except gameplay_state.Rejected as error:
         return await ctx.send(str(error))
+    controller = getattr(bot, 'gameplay_controller', None)
+    if controller:
+        controller.after_deputy_shot(game, ctx.author.id, receipts)
+        await ctx.send(message, ephemeral=True, allowed_mentions=NO_MENTIONS)
+        return
     channel = guild.get_channel(game.game_channel_id)
     if channel:
         for receipt in receipts:
@@ -2207,6 +2205,20 @@ async def clean(ctx: commands.Context) -> None:
 # RUN BOT
 # ==========================================
 
+@bot.hybrid_command(name='doused')
+@only_during_night_gameplay()
+async def doused(ctx: commands.Context) -> None:
+    game = get_game_by_player_id(ctx.author.id)
+    if game.player_roles.get(ctx.author.id) != 'Arsonist':
+        return await ctx.send('That ability is not available to you.', ephemeral=True)
+    from discord_output import chunk_lines
+    targets = [f"#{game.player_slots.get(uid, '?')}: {discord.utils.escape_markdown(p.display_name)}"
+               for uid in sorted(game.doused_players, key=lambda uid: game.player_slots.get(uid, uid))
+               for p in game.players if p.id == uid]
+    for text in chunk_lines(['**Doused players:**'] + (targets or ['None.']), max_chars=1900):
+        await ctx.send(text, ephemeral=True, allowed_mentions=NO_MENTIONS)
+
+
 @bot.hybrid_command()
 @commands.cooldown(1, 2, commands.BucketType.user)
 @only_during_night_gameplay()
@@ -2235,42 +2247,65 @@ async def gaze(ctx: commands.Context, target_number: int, second_target: int) ->
 async def cautious(ctx: commands.Context) -> None:
     return await _submit_action_command(ctx, 'cautious', ())
 
-async def _connect_forever() -> None:
-    """B1: supervised gateway session with backoff on fatal disconnect."""
+async def _reopen_client():
+    # Stop and drain jobs before clearing SDK caches. Game objects remain canonical.
+    await bot.gameplay_controller.stop_all()
+    for game in list(active_games.values()):
+        async with game._startup_lock:
+            pass
+        from gameplay.lifecycle import message_lock
+        async with message_lock(game.guild_id):
+            def pause():
+                if not game._rehydrate_pending:
+                    game._persist_player_ids = [p.id for p in game.players]
+                    game._persist_living_ids = [p.id for p in game.living_players]
+                    game._rehydrate_pending = True
+            await gameplay_state.commit(game, pause, persist=False, allow_recovery=True)
+    tasks = [getattr(bot, name, None) for name in ('_gateway_watchdog_task', '_mafia_dm_outbox_task')]
+    tasks = [task for task in tasks if task and task is not asyncio.current_task()]
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    await bot.close()
+    bot.clear()
+    # This application owns the default connector. discord.py clear() resets
+    # the session but retains its closed connector, so static_login must build another.
+    bot.http.connector = discord.utils.MISSING
+    # close() also clears the loop binding; clear() does not restore it.
+    await bot._async_setup_hook()
+    bot.gameplay_controller = Controller(bot)
+    bot._mafia_dm_outbox_started = False
+    bot._mafia_full_reconnect = True
+    bot._gateway_restart_requested = False
     _reset_gateway_watchdog_session()
-    token = os.getenv("DISCORD_TOKEN") or os.getenv("DISCORD_BOT_TOKEN")
+
+
+async def _connect_forever() -> None:
+    """Supervise full sessions; ordinary gateway reconnects remain SDK-managed."""
+    _reset_gateway_watchdog_session()
+    token = os.getenv('DISCORD_TOKEN') or os.getenv('DISCORD_BOT_TOKEN')
     if not token:
-        raise RuntimeError(
-            "DISCORD_TOKEN environment variable not set. Add it to your .env or environment variables before running."
-        )
-    backoff_min = float(os.getenv("MAFIABOT_RECONNECT_BACKOFF_MIN_SEC", "5"))
-    backoff_max = float(os.getenv("MAFIABOT_RECONNECT_BACKOFF_MAX_SEC", "300"))
-    backoff = backoff_min
+        raise RuntimeError('DISCORD_TOKEN environment variable not set.')
+    minimum = max(.1, float(os.getenv('MAFIABOT_RECONNECT_BACKOFF_MIN_SEC', '5')))
+    maximum = max(minimum, float(os.getenv('MAFIABOT_RECONNECT_BACKOFF_MAX_SEC', '300')))
+    backoff = minimum
     while True:
         try:
             await bot.start(token, reconnect=True)
-            logging.info("Gateway session ended normally.")
-            break
-        except discord.LoginFailure:
-            logging.critical("Discord token rejected — fix credentials.")
-            raise SystemExit(1)
-        except KeyboardInterrupt:
-            logging.info("Shutdown requested.")
-            try:
-                if not bot.is_closed():
-                    await bot.close()
-            except Exception:
-                pass
-            break
+            if not getattr(bot, '_gateway_restart_requested', False):
+                logging.info('Gateway session ended normally.')
+                return
+        except (discord.LoginFailure, discord.PrivilegedIntentsRequired):
+            logging.critical('Discord rejected the bot configuration; repair credentials/intents.')
+            raise
+        except asyncio.CancelledError:
+            raise
         except Exception:
-            logging.exception("Disconnected or fatal error — retrying in %.1fs", backoff)
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, backoff_max)
-            try:
-                if not bot.is_closed():
-                    await bot.close()
-            except Exception:
-                logging.debug("bot.close() during reconnect backoff failed", exc_info=True)
+            logging.exception('Gateway session failed; restarting in %.1fs.', backoff)
+        await _reopen_client()
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, maximum)
 
 
 def _require_discord_token() -> None:
@@ -2293,6 +2328,13 @@ async def _run_session():
     try:
         await _connect_forever()
     finally:
+        await bot.gameplay_controller.stop_all()
+        tasks = [getattr(bot, name, None) for name in ('_gateway_watchdog_task', '_mafia_dm_outbox_task')]
+        tasks = [task for task in tasks if task and task is not asyncio.current_task()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         if not bot.is_closed():
             await bot.close()
 

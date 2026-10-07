@@ -1,0 +1,20 @@
+{
+  "exception": {
+    "message": "[WinError 5] Access is denied during synthetic snapshot replacement.",
+    "type": "PermissionError"
+  },
+  "iteration": 200,
+  "kind": "phase_fuzz",
+  "payload": {
+    "steps": [
+      "start_day",
+      "persist_roundtrip",
+      "start_day",
+      "start_day",
+      "persist_roundtrip",
+      "start_night",
+      "start_day"
+    ]
+  },
+  "seed": 1
+}

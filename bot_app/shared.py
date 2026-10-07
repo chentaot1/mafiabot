@@ -7,7 +7,12 @@ from datetime import datetime, timezone
 from io import BytesIO
 
 from bot_app.imports import *  # noqa: F403
-from bot_app.instance import ALLOWED_GUILD_ID, bot, only_during_night_gameplay
+from config import load_allowed_guild_id
+from game import _require_bot
+from bot_app.instance import only_during_night_gameplay
+from discord_output import chunk_lines
+
+ALLOWED_GUILD_ID = load_allowed_guild_id()
 
 _logger = logging.getLogger(__name__)
 
@@ -109,7 +114,7 @@ _GUILD_UNAVAILABLE_MSG = (
 async def _guild_for_context(ctx: commands.Context, game: Game) -> Optional[discord.Guild]:
     if ctx.guild is not None:
         return ctx.guild
-    return await resolve_game_guild(bot, int(game.guild_id))
+    return await resolve_game_guild(_require_bot(), int(game.guild_id))
 
 
 async def _sync_living_ids_for_action(ctx: commands.Context, game: Game) -> Optional[List[int]]:
@@ -135,7 +140,7 @@ async def _living_slot_choices_for_user(
     game = get_game_by_player_id(user_id)
     if game is None:
         return []
-    guild = await resolve_game_guild(bot, int(game.guild_id))
+    guild = await resolve_game_guild(_require_bot(), int(game.guild_id))
     if guild is not None:
         now = time.monotonic()
         last = _autocomplete_last_sync_mono.get(int(game.guild_id), 0.0)
@@ -267,23 +272,7 @@ DISCORD_EMBED_FIELD_VALUE_MAX = 1024
 
 
 def _chunk_lines(lines: list[str], *, max_chars: int = 950) -> list[str]:
-    if not lines:
-        return ["(none)"]
-    chunks: list[str] = []
-    buf: list[str] = []
-    size = 0
-    for line in lines:
-        add = len(line) + (1 if buf else 0)
-        if buf and size + add > max_chars:
-            chunks.append("\n".join(buf))
-            buf = [line]
-            size = len(line)
-        else:
-            buf.append(line)
-            size += add
-    if buf:
-        chunks.append("\n".join(buf))
-    return chunks
+    return chunk_lines(lines, max_chars=max_chars)
 
 
 def _add_chunked_fields(

@@ -505,13 +505,13 @@ async def test_blocked_duel_dms_still_complete_at_original_timeout(world):
 async def test_departure_lookup_cannot_resurrect_a_concurrent_death(world):
     from gameplay.death import apply_death
     game,guild,_,_,_=world
-    real=game.get_member_safe
+    real=game.lookup_member
     entered,release=asyncio.Event(),asyncio.Event()
     async def slow(guild,uid):
         if uid==3:
             entered.set(); await release.wait()
         return await real(guild,uid)
-    game.get_member_safe=slow
+    game.lookup_member=slow
     sync=asyncio.create_task(game.sync_living_players(guild)); await entered.wait()
     await st.commit(game,lambda:apply_death(game,3,'manual'))
     release.set(); await sync
@@ -639,7 +639,7 @@ async def test_duel_click_rechecks_server_departures_before_persistence(world):
     game,guild,_,_,_=world
     game.player_roles[1]='Pirate'
     result=await actions.submit(game,1,'plunder',(3,)); token=result.action['duel_token']
-    game.get_member_safe=AsyncMock(side_effect=lambda g,uid: g.get_member(uid) if uid!=3 else None)
+    game.lookup_member=AsyncMock(side_effect=lambda g,uid: g.get_member(uid) if uid!=3 else None)
     with pytest.raises(st.Rejected): await duels.choose(game,1,token,3,'rock',guild=guild)
     assert not game.night_actions[1]['duel_choices']
 
@@ -722,3 +722,40 @@ async def test_completed_resolution_receipt_survives_the_next_night_identity(wor
     recovered=Game.from_persisted(persistence.load_state(123))
     assert recovered.gameplay['resolution']['night_token']=='night-one'
     assert recovered.gameplay['resolution']['public_delivery_pending'] and not recovered.resolving
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status', [403, 503])
+async def test_modern_trial_delivery_retry_keeps_ballots_and_deadline(world, monkeypatch, status):
+    game, _, controller, channels, _ = world
+    trial = await new_trial(world)
+    token = trial['id']
+    await trials.cast(game, token, 1, 3, 'nomination')
+    await expire(game, token)
+    await expire(game, token)
+    await trials.cast(game, token, 1, 'guilty', 'judgment')
+    await controller.render_trial(game)
+    saved = deepcopy(persistence.load_state(123)['gameplay']['trial'])
+    channel = channels[10]
+    original_fetch, original_sleep = channel.fetch_message, asyncio.sleep
+    error_type = discord.Forbidden if status == 403 else discord.HTTPException
+    error = error_type(SimpleNamespace(status=status, reason='unavailable'), 'unavailable')
+    calls = 0
+
+    async def fail_once(mid):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise error
+        return await original_fetch(mid)
+
+    async def retry_without_delay(delay):
+        await original_sleep(0)
+
+    monkeypatch.setattr(channel, 'fetch_message', fail_once)
+    monkeypatch.setattr(asyncio, 'sleep', retry_without_delay)
+    await controller.start_job((game.guild_id, 'trial-test', token), lambda: controller.render_trial(game))
+    assert calls == 2 and len(channel.messages) == 1
+    assert game.gameplay['trial'] == saved
+    assert persistence.load_state(123)['gameplay']['trial'] == saved
+    assert not game.state_lock.locked()

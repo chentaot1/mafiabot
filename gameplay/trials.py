@@ -176,4 +176,5 @@ async def finish(game, token):
         trial = st.session(game, token, open_only=False)
         trial["stage"] = "done"
         clear_flags(game)
+        game.gameplay.setdefault('trials', {})[token] = trial
     await st.commit(game, update)

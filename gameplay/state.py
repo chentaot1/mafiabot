@@ -34,6 +34,9 @@ def require_current(game, *, phase=None, expected=None) -> None:
     from game import active_games
     if active_games.get(game.guild_id) is not game or not game.in_progress or game.ending:
         raise Rejected("This game has ended. Open the controls for the current game.")
+    if (game._rehydrate_pending or game._recovering_permissions
+            or game.gameplay.get('startup', {}).get('complete') is False):
+        raise Rejected("Game setup/recovery is still in progress. Please retry shortly.")
     if phase and game.phase != phase:
         raise Rejected(f"These controls are only available during {phase}.")
     if expected is not None and identity(game) != tuple(expected):
@@ -54,6 +57,7 @@ _FIELDS = (
     "alive_role_id", "stand_role_id", "lockdown_role_id", "locked_channel_ids",
     "night", "tribunal_state", "bloodless_cycle_streak", "deaths_this_cycle",
     "bloodless_stalemate_pending", "cleanup_pending",
+    "_rehydrate_pending", "_recovering_permissions", "_persist_player_ids", "_persist_living_ids",
 )
 
 
@@ -70,10 +74,12 @@ async def flush_committed(game) -> bool:
     return cancelled
 
 
-async def commit(game, update: Callable[[], T], *, persist=True) -> T:
+async def commit(game, update: Callable[[], T], *, persist=True, allow_recovery=False) -> T:
     """Apply a synchronous model change and save it as one guarded operation."""
     cancelled = False
     async with game.state_lock:
+        if (game._rehydrate_pending or game._recovering_permissions) and not allow_recovery:
+            raise Rejected("Saved players are still being recovered. Please retry shortly.")
         before = {name: (list(getattr(game, name)) if name in _REFERENCES else
                          deepcopy(getattr(game, name))) for name in _FIELDS}
         try:

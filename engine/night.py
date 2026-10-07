@@ -1291,6 +1291,24 @@ async def _dm_actor_id(game: "Game", guild: discord.Guild, actor_id: int, text: 
     return True
 
 
+async def _dm_report(game, guild, actor_id, text, *, kind, source_id=None, status='result', selected=()):
+    """Record the exact private feedback routed to this recipient, never another player's report."""
+    delivered = await _dm_actor_id(game, guild, actor_id, text)
+    if delivered:
+        from gameplay.reports import remember
+        remember(game, actor_id, text, kind=kind, source_id=source_id, status=status, selected=selected)
+    return delivered
+
+
+def _seer_report_selection(game, actor_id, action):
+    # Original choices are known to the player. Do not expose hidden transport
+    # destinations or a Witch's forced target through the history interface.
+    selected = game.role_states.get(actor_id, {}).get('seer_submitted_targets')
+    if selected is None and action.get('_controlled_by') is None:
+        selected = action.get('targets')
+    return selected if isinstance(selected, list) else []
+
+
 def _lookout_visitors_excluding_self(visitors: List[int], watcher_id: int) -> List[int]:
     wid = int(watcher_id)
     return [int(v) for v in visitors if int(v) != wid]
@@ -1368,7 +1386,8 @@ async def resolve_investigative(
         a_type = action.get("type")
         if actor_id in blocked:
             if a_type == "gaze" and game.player_roles.get(actor_id) == "Seer":
-                if await _dm_actor_id(game, guild, actor_id, tos_msg.seer_gaze_interrupted()):
+                if await _dm_report(game, guild, actor_id, tos_msg.seer_gaze_interrupted(), kind='seer', status='blocked',
+                                    selected=_seer_report_selection(game, actor_id, action)):
                     _mark_investigative_sent_tonight(game, actor_id)
                     investigative_sent_ids.append(int(actor_id))
             elif a_type == "watch" and game.player_roles.get(actor_id) == "Lookout":
@@ -1501,7 +1520,8 @@ async def resolve_investigative(
                     mayor_block = True
                     break
             if mayor_block:
-                if await _dm_actor_id(game, guild, actor_id, tos_msg.seer_gaze_mayor_blocked()):
+                if await _dm_report(game, guild, actor_id, tos_msg.seer_gaze_mayor_blocked(), kind='seer', status='unavailable',
+                                    selected=_seer_report_selection(game, actor_id, action)):
                     _mark_investigative_sent_tonight(game, actor_id)
                     investigative_sent_ids.append(int(actor_id))
                 continue
@@ -1516,7 +1536,8 @@ async def resolve_investigative(
             key = tuple(sorted((submitted_a, submitted_b)))
             prior = {tuple(sorted((int(x[0]), int(x[1])))) for x in hist if isinstance(x, (list, tuple)) and len(x) == 2}
             if key in prior:
-                if await _dm_actor_id(game, guild, actor_id, tos_msg.seer_gaze_duplicate_pair()):
+                if await _dm_report(game, guild, actor_id, tos_msg.seer_gaze_duplicate_pair(), kind='seer', status='duplicate',
+                                    selected=_seer_report_selection(game, actor_id, action)):
                     _mark_investigative_sent_tonight(game, actor_id)
                     investigative_sent_ids.append(int(actor_id))
                 continue
@@ -1529,7 +1550,8 @@ async def resolve_investigative(
                 msg = tos_msg.seer_gaze_friends()
             else:
                 msg = tos_msg.seer_gaze_enemies()
-            if await _dm_actor_id(game, guild, actor_id, msg):
+            if await _dm_report(game, guild, actor_id, msg, kind='seer',
+                                selected=_seer_report_selection(game, actor_id, action)):
                 hist.append([submitted_a, submitted_b])
                 _mark_investigative_sent_tonight(game, actor_id)
                 investigative_sent_ids.append(int(actor_id))
@@ -1540,7 +1562,7 @@ async def resolve_investigative(
                     except (TypeError, ValueError):
                         wid = None
                     if wid is not None:
-                        await _dm_actor_id(game, guild, wid, tos_msg.witch_stolen_gaze(msg))
+                        await _dm_report(game, guild, wid, tos_msg.witch_stolen_gaze(msg), kind='seer', source_id=actor_id, status='stolen')
 
     phase_done = investigative_phase_fulfilled(
         game, blocked_set_pre, investigative_sent_ids
@@ -1633,19 +1655,19 @@ async def deliver_psychic_visions(game: "Game", guild: discord.Guild, blocked: C
         from messages import tos as tos_msg
 
         if psychic_id in blocked_set:
-            await _dm_actor_id(game, guild, psychic_id, tos_msg.psychic_rb())
+            await _dm_report(game, guild, psychic_id, tos_msg.psychic_rb(), kind='psychic', status='blocked')
             continue
 
         if len(living_set) <= 3:
             msg = tos_msg.psychic_too_small_night()
-            await _dm_actor_id(game, guild, psychic_id, msg)
+            await _dm_report(game, guild, psychic_id, msg, kind='psychic', status='unavailable')
             thief = game.role_states.get(psychic_id, {}).get("psychic_vision_recipient_id")
             try:
                 tid = int(thief) if thief is not None else None
             except (TypeError, ValueError):
                 tid = None
             if tid is not None and tid != psychic_id and tid in living_set:
-                await _dm_actor_id(game, guild, tid, tos_msg.psychic_stolen_useless())
+                await _dm_report(game, guild, tid, tos_msg.psychic_stolen_useless(), kind='psychic', source_id=psychic_id, status='stolen')
             continue
 
         odd_vision = int(getattr(game, "day_number", 0)) % 2 == 1
@@ -1698,14 +1720,14 @@ async def deliver_psychic_visions(game: "Game", guild: discord.Guild, blocked: C
                     slots = sorted({_slot(g), _slot(h)}, key=lambda s: int(s) if str(s).isdigit() else 10**9)
                     msg = tos_msg.psychic_vision_good_slots(slots[0], slots[1])
 
-        await _dm_actor_id(game, guild, psychic_id, msg)
+        await _dm_report(game, guild, psychic_id, msg, kind='psychic')
         thief = game.role_states.get(psychic_id, {}).get("psychic_vision_recipient_id")
         try:
             wid = int(thief) if thief is not None else None
         except (TypeError, ValueError):
             wid = None
         if wid is not None and wid != psychic_id and wid in living_set:
-            await _dm_actor_id(game, guild, wid, tos_msg.psychic_stolen_prefix(msg))
+            await _dm_report(game, guild, wid, tos_msg.psychic_stolen_prefix(msg), kind='psychic', source_id=psychic_id, status='stolen')
 
 
 async def send_night_feedback(

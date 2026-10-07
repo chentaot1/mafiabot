@@ -125,13 +125,22 @@ def _unique_tmp_for(path: Path) -> Path:
     return path.with_name(f"{path.name}.tmp.{nonce}")
 
 
+class StateReadError(OSError):
+    """Recovery is unavailable; callers must not replace the existing match."""
+
+
 def load_state(guild_id: int) -> Optional[Dict[str, Any]]:
     path = _state_path(guild_id)
-    if not path.exists():
-        return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("Game snapshot must be an object")
+        return data
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise StateReadError("Saved game is temporarily unreadable; retry recovery before starting another match.") from error
+    except (ValueError, UnicodeError):
         logging.exception("Failed to load persisted state from %s; treating as no state.", str(path))
         # CR17 — quarantine corrupt file so operators can recover from .corrupt backup.
         try:

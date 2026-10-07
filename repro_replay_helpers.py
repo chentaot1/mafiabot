@@ -89,6 +89,9 @@ def run_phase_fuzz_steps(steps: List[Any]) -> None:
 
     with _PHASE_REPLAY_LOCK:
         old_state_dir = p.STATE_DIR
+        import game as gm
+        old_games, old_bot = gm.active_games, gm._BOT
+        gm.active_games, gm._BOT = {}, None
         try:
             with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
                 p.STATE_DIR = Path(td)  # type: ignore[assignment]
@@ -101,6 +104,7 @@ def run_phase_fuzz_steps(steps: List[Any]) -> None:
                 ctx = _PhaseCtx(guild)
                 g = Game(guild_id=guild.id)
                 g.in_progress = True
+                gm.active_games[guild.id] = g
                 g.players = list(members.values())  # type: ignore[assignment]
                 g.living_players = list(members.values())  # type: ignore[assignment]
                 for pid in range(1, 8):
@@ -116,10 +120,13 @@ def run_phase_fuzz_steps(steps: List[Any]) -> None:
                         g2 = Game.from_persisted(g.to_persisted())
                         g = g2
                         g.in_progress = True
+                        ctx = _phase_attach_members_and_ctx(g)
+                        gm.active_games[guild.id] = g
                     else:
                         raise AssertionError(f"Unknown phase step: {op!r}")
         finally:
             p.STATE_DIR = old_state_dir  # type: ignore[assignment]
+            gm.active_games, gm._BOT = old_games, old_bot
 
 
 def run_phase_fuzz_payload(payload: Dict[str, Any]) -> None:
@@ -135,12 +142,16 @@ def run_phase_fuzz_payload(payload: Dict[str, Any]) -> None:
 
     with _PHASE_REPLAY_LOCK:
         old_state_dir = p.STATE_DIR
+        import game as gm
+        old_games, old_bot = gm.active_games, gm._BOT
+        gm.active_games, gm._BOT = {}, None
         try:
             with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
                 p.STATE_DIR = Path(td)  # type: ignore[assignment]
                 g = Game.from_persisted(deepcopy(initial))
                 ctx = _phase_attach_members_and_ctx(g)
                 g.in_progress = True
+                gm.active_games[ctx.guild.id] = g
 
                 for op in steps:
                     if op == "start_night":
@@ -151,10 +162,13 @@ def run_phase_fuzz_payload(payload: Dict[str, Any]) -> None:
                         g2 = Game.from_persisted(g.to_persisted())
                         g = g2
                         g.in_progress = True
+                        ctx = _phase_attach_members_and_ctx(g)
+                        gm.active_games[ctx.guild.id] = g
                     else:
                         raise AssertionError(f"Unknown phase step: {op!r}")
         finally:
             p.STATE_DIR = old_state_dir  # type: ignore[assignment]
+            gm.active_games, gm._BOT = old_games, old_bot
 
 
 def run_phase_repro_payload(payload: Dict[str, Any]) -> None:
