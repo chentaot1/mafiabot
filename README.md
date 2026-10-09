@@ -265,7 +265,7 @@ Retained replay fixtures are synthetic. Some replay collections are empty and ap
 
 ### CI and validation scope
 
-[Windows/Python 3.14.8 and 3.12 CI](.github/workflows/tests.yml) installs the dependency set in `constraints.txt` and runs the bounded pytest launcher, the standalone smoke suite, 200 seeded engine iterations, and the simulator role audit on pushes and pull requests. The October 6, 2026 gameplay and compatibility checks passed **451 pytest tests, with three skipped empty replay collections**, plus 47 engine scenarios with 200 seeded fuzz iterations and the 32-role audit on both Python versions. The earlier integration pass also exercised 50 generated matches with two workers and 10 fixed-lineup matches including all five restored roles. These are bounded checks, not every optional large experiment.
+[Windows/Python 3.14.8 and 3.12 CI](.github/workflows/tests.yml) installs the dependency set in `constraints.txt` and runs the bounded pytest launcher, the standalone smoke suite, 200 seeded engine iterations, and the simulator role audit on pushes and pull requests. The October 9, 2026 recovery update passed **699 pytest tests, with three skipped empty replay collections**, on each Python version, plus the standalone smoke suite. [GitHub Actions also passed for the published update](https://github.com/chentaot1/mafiabot/actions/runs/37942475123). The earlier integration pass exercised 47 deterministic engine scenarios, the 32-role audit, 50 generated matches with two workers, and 10 fixed-lineup matches including all five restored roles. These are bounded checks, not every optional large experiment.
 
 The five added roles now have [upgraded private controls](docs/MODERN_GAMEPLAY.md#controls-for-the-five-added-roles): Deputy day shots with a final Fire confirmation, explicit Serial Killer mode buttons, preselected Guardian Angel wards, and Seer/Psychic report cards with persistent private histories. Reopen these with `/actions` or `!actions`. Existing role rules and command syntax remain in place.
 
@@ -344,7 +344,9 @@ python -m pip install -c constraints.txt -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-Configure your own values in `.env`:
+The public repository includes only a blank `.env.example` template. Your `.env`, bot token, server and player IDs, saved games, databases, and logs stay local and are excluded from Git. A fresh installation has no configured server or private-channel mapping.
+
+Configure your own values in the local `.env` you just created:
 
 - `DISCORD_TOKEN`: application bot token. `DISCORD_BOT_TOKEN` is accepted as an alias.
 - `ALLOWED_GUILD_ID`: the server hosting the game.
