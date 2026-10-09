@@ -2564,10 +2564,10 @@ class Game:
                         current()
             await commit(self, lambda: checkpoint(access_cleaned=ok), persist=self.in_progress)
         if channel and not receipt.get('announcement_id'):
-            message = None
-            marker = f"-# Game event: {receipt.get('notice_id', '')}"
-            destination = getattr(channel, 'channel', channel)
-            try:
+            async def announce():
+                message = None
+                marker = f"-# Game event: {receipt.get('notice_id', '')}"
+                destination = getattr(channel, 'channel', channel)
                 if receipt.get('notice_id') and hasattr(destination, 'history'):
                     try:
                         async for candidate in destination.history(limit=100):
@@ -2578,31 +2578,48 @@ class Game:
                         pass  # Sending may still work without Read Message History.
                 current()
                 if message is None:
-                    message = await finish_pending(channel.send(death_text(receipt) + ('\n' + marker if receipt.get('notice_id') else ''),
-                        allowed_mentions=discord.AllowedMentions.none()))
+                    message = await channel.send(death_text(receipt) + ('\n' + marker if receipt.get('notice_id') else ''),
+                        allowed_mentions=discord.AllowedMentions.none())
                 await commit(self, lambda: checkpoint(announcement_id=getattr(message, 'id', None)), persist=self.in_progress)
+            try:
+                # Save a successful send's ID before cancellation releases the
+                # message lock; recovery may lack permission to read history.
+                await finish_pending(announce())
             except discord.HTTPException:
                 pass  # The saved receipt is retried separately from access cleanup.
         if not receipt.get('notices_delivered'):
-            if member and receipt['real_role'] == 'Jester' and receipt['cause'] == 'lynch' and receipt['voters']:
+            async def send_notice(uid, text, recipient=None):
+                if uid in receipt.get('notice_delivered_ids', []):
+                    return
+                recipient = recipient or await self.get_member_safe(guild, uid)
+                current()
+                if recipient:
+                    try:
+                        await recipient.send(text)
+                    except discord.Forbidden:
+                        pass  # Blocked DMs are terminal; temporary errors retry.
+                    except discord.HTTPException:
+                        return
+                def notice_done():
+                    current()
+                    completed = self.gameplay['deaths'][str(receipt['player_id'])].setdefault('notice_delivered_ids', [])
+                    if uid not in completed:
+                        completed.append(uid)
+                await commit(self, notice_done, persist=self.in_progress)
+            recipients = set(receipt.get('converted', []))
+            if receipt['real_role'] == 'Jester' and receipt['cause'] == 'lynch' and receipt['voters']:
+                recipients.add(receipt['player_id'])
                 eligible = [f"#{self.player_slots.get(uid, '?')}: {p.display_name}" for uid in receipt['voters']
                             for p in self.players if p.id == uid]
-                try:
-                    await member.send('You have been successfully lynched! You win!\nChoose a Guilty or abstaining voter to haunt:\n' +
-                                      '\n'.join(eligible) + '\nUse /actions tonight, or !haunt for eligible numbers.')
-                except discord.HTTPException:
-                    pass
-                current()
+                await finish_pending(send_notice(receipt['player_id'],
+                    'You have been successfully lynched! You win!\nChoose a Guilty or abstaining voter to haunt:\n' +
+                    '\n'.join(eligible) + '\nUse /actions tonight, or !haunt for eligible numbers.', member))
             for uid in receipt.get('converted', []):
-                converted = await self.get_member_safe(guild, uid)
-                if converted:
-                    try:
-                        await converted.send('Your target has died. You have failed your goal and become a Jester.')
-                    except discord.HTTPException:
-                        pass
-                current()
-            await commit(self, lambda: checkpoint(notices_delivered=True), persist=self.in_progress)
-        await commit(self, lambda: checkpoint(delivered=bool(receipt.get('access_cleaned') and receipt.get('announcement_id'))),
+                await finish_pending(send_notice(uid, 'Your target has died. You have failed your goal and become a Jester.'))
+            await commit(self, lambda: checkpoint(notices_delivered=recipients.issubset(set(receipt.get('notice_delivered_ids', [])))),
+                         persist=self.in_progress)
+        await commit(self, lambda: checkpoint(delivered=bool(receipt.get('access_cleaned') and receipt.get('announcement_id')
+                                                            and receipt.get('notices_delivered'))),
             persist=self.in_progress)
 
     async def start_night(self, ctx, *, trial_token=None):

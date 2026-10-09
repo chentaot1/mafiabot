@@ -33,6 +33,10 @@ class LeaderboardRow:
     wins: int
 
 
+class DatabaseBusy(OSError):
+    """Retryable SQLite contention; the original SQLite error is the cause."""
+
+
 class Database:
     """
     SQLite-backed stats + match history for a single-guild bot.
@@ -48,12 +52,22 @@ class Database:
 
     @contextmanager
     def _transaction(self):
-        conn = self._conn()
+        conn = None
         try:
+            conn = self._conn()
             with conn:
                 yield conn
+        except sqlite3.OperationalError as error:
+            code = getattr(error, 'sqlite_errorcode', None)
+            # Extended BUSY/LOCKED codes have the same low-byte base code.
+            # Retrying with our next fresh connection also repairs an outdated
+            # WAL snapshot. Schema, permissions and corruption errors surface.
+            if isinstance(code, int) and (code & 0xFF) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                raise DatabaseBusy('The game database is temporarily busy. Please retry shortly.') from error
+            raise
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
 
     def _conn(self) -> sqlite3.Connection:
         _ensure_parent_dir(self.path)
@@ -1504,6 +1518,18 @@ class Database:
             raise
         finally:
             conn.close()
+
+    def release_dm_outbox_claims(self, rows: list[dict]) -> int:
+        """Return unfinished claims to pending without changing settled receipts."""
+        if not rows:
+            return 0
+        with self._transaction() as conn:
+            cur = conn.executemany(
+                """UPDATE dm_outbox SET status='pending', sending_since=NULL
+                   WHERE id=? AND status='sending' AND sending_since=?""",
+                [(int(row['id']), row['sending_since']) for row in rows],
+            )
+            return int(cur.rowcount)
 
     def mark_dm_outbox_sent(self, msg_id: int) -> None:
         now = _utcnow_iso()

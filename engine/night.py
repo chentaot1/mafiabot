@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import random
 from typing import Collection, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
 import discord
+
+from async_work import run_blocking
 
 from config import (
     ALL_MAFIA_ROLES,
@@ -1280,11 +1283,13 @@ async def _dm_actor_id(game: "Game", guild: discord.Guild, actor_id: int, text: 
     if db is None:
         return False
     gk = getattr(game, "game_key", None) or "unknown"
-    digest = abs(hash(text)) % (10**12)
-    db.enqueue_dm_outbox(
+    # Python's built-in hash changes between processes, including on restart.
+    digest = hashlib.sha256(text.encode('utf-8')).hexdigest()
+    await run_blocking(db.enqueue_dm_outbox,
         guild_id=int(game.guild_id),
         kind="night_result",
         dedupe_key=f"mafia_night:{game.guild_id}:{gk}:{int(game.day_number)}:{int(actor_id)}:{digest}",
+        match_key=getattr(game, "game_key", None),
         target_user_id=int(actor_id),
         content=text,
     )

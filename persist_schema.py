@@ -127,17 +127,8 @@ def game_to_persisted(game: Any) -> Dict:
         "night_completion_snapshot": game.night.night_completion_snapshot,
         "psychic_visions_delivered_this_night": game.night.psychic_visions_delivered_this_night,
     }
-    inline_pending = getattr(game, "_pending_endgame", None)
-    if not (isinstance(inline_pending, dict) and inline_pending.get("outcome")):
-        try:
-            from persistence import load_state
-
-            existing = load_state(int(game.guild_id)) or {}
-            inline_pending = existing.get("_pending_endgame")
-        except Exception:
-            inline_pending = None
-    if isinstance(inline_pending, dict) and inline_pending.get("outcome"):
-        out["_pending_endgame"] = dict(inline_pending)
+    # save_state preserves the disk-owned endgame marker under its write lock.
+    # Copying it here could lose a later addition or resurrect a cleared marker.
     return deepcopy(out)
 
 
@@ -366,9 +357,6 @@ def game_from_persisted(data: Dict) -> Any:
             act["duel_finished"] = True
             act["duel_outcome_ready"] = True
             act["duel_won"] = False
-    inline_pe = data.get("_pending_endgame")
-    if isinstance(inline_pe, dict) and inline_pe.get("outcome"):
-        g._pending_endgame = dict(inline_pe)
     from gameplay.records import load_ui, repair_duel
     g.gameplay = load_ui(data.get("gameplay"))
     for action in g.night_actions.values():

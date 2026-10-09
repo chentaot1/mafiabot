@@ -5,9 +5,27 @@ from discord import app_commands
 from discord.ext import commands
 
 
+_RECOVERY_UNAVAILABLE = (
+    "Saved game data is temporarily unavailable. Please try again shortly; "
+    "recovery must finish before starting another game."
+)
+_DATABASE_BUSY = 'The game database is temporarily busy. Please try again shortly.'
+
+
 async def on_command_error(ctx: commands.Context, error: Exception) -> None:
     from bot_app.shared import safe_reply
+    from persistence import StateReadError
+    from database import DatabaseBusy
 
+    original = getattr(error, "original", error)
+    if isinstance(original, StateReadError):
+        logging.warning("Command deferred because saved game data is unreadable", exc_info=original)
+        await safe_reply(ctx, _RECOVERY_UNAVAILABLE)
+        return
+    if isinstance(original, DatabaseBusy):
+        logging.warning('Command deferred because the game database is busy', exc_info=original)
+        await safe_reply(ctx, _DATABASE_BUSY)
+        return
     if isinstance(error, commands.CommandNotFound):
         return
     if isinstance(error, commands.CheckFailure):
@@ -55,9 +73,18 @@ async def on_app_command_tree_error(interaction, error: app_commands.AppCommandE
     # to (e.g., via defer), so we fall back to followup.send. Both wrapped
     # in best-effort try/except to avoid raising inside the error handler.
     from bot_app.shared import safe_interaction_ephemeral
+    from persistence import StateReadError
+    from database import DatabaseBusy
 
+    original = getattr(error, "original", error)
+    if isinstance(original, StateReadError):
+        message = _RECOVERY_UNAVAILABLE
+    elif isinstance(original, DatabaseBusy):
+        message = _DATABASE_BUSY
+    else:
+        message = "⚠️ Something went wrong running that command. The GM has been notified in the logs."
     if not await safe_interaction_ephemeral(
         interaction,
-        "⚠️ Something went wrong running that command. The GM has been notified in the logs.",
+        message,
     ):
         logging.debug("on_app_command_tree_error could not notify user interaction_id=%s", getattr(interaction, "id", None))

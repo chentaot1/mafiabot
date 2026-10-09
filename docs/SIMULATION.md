@@ -4,7 +4,7 @@ The project has two different kinds of simulation. They answer different questio
 
 ## Balance modeling
 
-[`scripts/monte_carlo_sim.py`](../scripts/monte_carlo_sim.py) exposes the modular simulator in [`scripts/monte_carlo`](../scripts/monte_carlo). It samples rosters and modeled player decisions, advances day/night cycles, and aggregates faction and personal outcomes. Its bridge executes the production night pipeline with headless members/guilds. The default generator and several win/death helpers are shared with the bot.
+[`scripts/monte_carlo_sim.py`](../scripts/monte_carlo_sim.py) exposes the modular simulator in [`scripts/monte_carlo`](../scripts/monte_carlo). It samples rosters and modeled player decisions, advances day/night cycles, and aggregates faction and personal outcomes. Its bridge executes the production night pipeline with headless members/guilds. Simulation models keep checkpoints in memory without reading or replacing saved bot games, in both single-process and parallel trials. Real games retain their normal saving behavior. The default generator and several win/death helpers are shared with the bot.
 
 It supports:
 

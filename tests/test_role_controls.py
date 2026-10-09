@@ -216,7 +216,11 @@ async def test_report_history_is_committed_before_private_cards_and_recovers_onc
             await resolution.run(game, SimpleNamespace(guild=guild, send=channels[10].send))
     assert not channels[101].sent and not channels[104].sent
     saved = persistence.load_state(123)
-    assert len(reports.history(game, 1)) == len(reports.history(game, 4)) == 1
+    assert len(reports.history(game, 1)) == len(reports.history(game, 4)) == 1, {
+        'living_ids': [p.id for p in game.living_players],
+        'role_states': game.role_states,
+        'night_snapshot': game.night_completion_snapshot,
+    }
     recovered = Game.from_persisted(saved)
     await recovered.rehydrate_members(guild)
     recovered.check_win_conditions = AsyncMock(return_value=False)

@@ -251,8 +251,9 @@ async def test_night_shoot_dispatcher_accepts_dm_and_rejects_public_channel(mode
 async def test_startgame_initializes_and_explains_all_five_restored_roles(model,monkeypatch):
     game,guild,members=model
     import bot as module
+    from config import PLAYING_ROLE_ID
     guild.id=123
-    guild.get_role=lambda rid:None
+    guild.get_role=lambda rid:SimpleNamespace(id=rid) if rid==PLAYING_ROLE_ID else None
     game.in_progress=False
     game.phase=None
     game.setup_infrastructure=AsyncMock()
@@ -268,6 +269,7 @@ async def test_startgame_initializes_and_explains_all_five_restored_roles(model,
     assert game.role_states[4]['deputy_shots_remaining']==1
     assert game.role_states[3]['seer_pair_history']==[]
     assert game.role_states[5]['sk_cautious'] is False
+    assert game.gameplay['startup']['complete']
     assert all(p.send.await_count>=3 for p in members[:5])
 
 

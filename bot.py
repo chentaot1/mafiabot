@@ -278,54 +278,80 @@ def _outbox_match_key(row):
     if row.get('match_key'):
         return row['match_key']
     key = str(row.get('dedupe_key') or '')
+    # Older night results appended day, recipient and digest after the match.
+    # Split from the right because match identities contain timestamp colons.
+    if row.get('kind') == 'night_result' and key.startswith('mafia_night:') and key.count(':') >= 5:
+        return key.rsplit(':', 3)[0].split(':', 2)[2]
     # Compatibility with the existing mafia_kind:guild:match:user format.
     if key.startswith('mafia_') and key.count(':') >= 3:
         return key.rsplit(':', 1)[0].split(':', 2)[2]
     return None
 
 
+async def _send_outbox_dm(user, db, msg_id, content):
+    """Keep a successful send and its receipt inside the same shutdown barrier."""
+    await user.send(content)
+    await run_blocking(db.mark_dm_outbox_sent, msg_id)
+
+
+async def _deliver_outbox_batch(db) -> None:
+    """Own claimed rows through delivery or their return to the pending queue."""
+    from gameplay.lifecycle import message_lock
+    rows = []
+    async def claim():
+        # Keep ownership visible if shutdown cancels while SQLite commits.
+        rows.extend(await run_blocking(db.claim_dm_outbox_batch, limit=25))
+    try:
+        await finish_pending(claim())
+        for row in rows:
+            mid, uid, gid = int(row['id']), int(row['target_user_id']), int(row['guild_id'])
+            try:
+                user = bot.get_user(uid) or await bot.fetch_user(uid)
+                async with message_lock(gid):
+                    match = _outbox_match_key(row)
+                    current = active_games.get(gid)
+                    if match and current is None:
+                        # READY may still be recovering the saved game. Check
+                        # its identity before even sending a Game Over notice.
+                        data = await run_blocking(load_state, gid)
+                        if data and data.get('in_progress'):
+                            if data.get('game_key') != match:
+                                await run_blocking(db.mark_dm_outbox_superseded, mid)
+                                continue
+                            if row['kind'] != 'game_over':
+                                await run_blocking(db.defer_dm_outbox, mid)
+                                continue
+                    obsolete = bool(match and (
+                        (current is not None and current.game_key not in (None, match)) or
+                        (row['kind'] != 'game_over' and (current is None or not current.in_progress
+                            or current.ending or current.game_key != match))))
+                    if obsolete:
+                        await run_blocking(db.mark_dm_outbox_superseded, mid)
+                        continue
+                    await finish_pending(_send_outbox_dm(user, db, mid, str(row['content'])))
+            except persistence.StateReadError:
+                # Recovery did not reach Discord delivery. Preserve the
+                # retry budget while the saved match is unavailable.
+                await run_blocking(db.defer_dm_outbox, mid)
+            except discord.HTTPException as error:
+                delay = min(600, int(getattr(error, 'retry_after', 60) or 60) + 5) if error.status == 429 else 120
+                await run_blocking(db.retry_dm_outbox_later, mid, error=type(error).__name__, delay_seconds=delay)
+            except Exception as error:
+                await run_blocking(db.retry_dm_outbox_later, mid, error=type(error).__name__, delay_seconds=90)
+    finally:
+        if rows:
+            await run_blocking(db.release_dm_outbox_claims, rows)
+
+
 async def _dm_outbox_pump_loop() -> None:
     """Drain queued messages off the event loop and validate their match at delivery."""
-    from gameplay.lifecycle import message_lock
     await bot.wait_until_ready()
     while not bot.is_closed():
         try:
             db = getattr(bot, 'db', None)
             if db:
                 await run_blocking(db.requeue_stale_dm_outbox_sending, stale_after_seconds=300)
-                rows = await run_blocking(db.claim_dm_outbox_batch, limit=25)
-                for row in rows:
-                    mid, uid, gid = int(row['id']), int(row['target_user_id']), int(row['guild_id'])
-                    try:
-                        user = bot.get_user(uid) or await bot.fetch_user(uid)
-                        async with message_lock(gid):
-                            match = _outbox_match_key(row)
-                            current = active_games.get(gid)
-                            if match and current is None:
-                                # READY may still be recovering the saved game. Check
-                                # its identity before even sending a Game Over notice.
-                                data = await run_blocking(load_state, gid)
-                                if data and data.get('in_progress'):
-                                    if data.get('game_key') != match:
-                                        await run_blocking(db.mark_dm_outbox_superseded, mid)
-                                        continue
-                                    if row['kind'] != 'game_over':
-                                        await run_blocking(db.defer_dm_outbox, mid)
-                                        continue
-                            obsolete = bool(match and (
-                                (current is not None and current.game_key not in (None, match)) or
-                                (row['kind'] != 'game_over' and (current is None or not current.in_progress
-                                    or current.ending or current.game_key != match))))
-                            if obsolete:
-                                await run_blocking(db.mark_dm_outbox_superseded, mid)
-                                continue
-                            await finish_pending(user.send(str(row['content'])))
-                            await run_blocking(db.mark_dm_outbox_sent, mid)
-                    except discord.HTTPException as error:
-                        delay = min(600, int(getattr(error, 'retry_after', 60) or 60) + 5) if error.status == 429 else 120
-                        await run_blocking(db.retry_dm_outbox_later, mid, error=type(error).__name__, delay_seconds=delay)
-                    except Exception as error:
-                        await run_blocking(db.retry_dm_outbox_later, mid, error=type(error).__name__, delay_seconds=90)
+                await _deliver_outbox_batch(db)
         except Exception:
             logging.exception('dm_outbox pump iteration failed')
         await asyncio.sleep(12)
@@ -636,9 +662,11 @@ async def on_ready() -> None:
     # Initialize SQLite DB (leaderboards/history). Non-fatal if it fails.
     if not getattr(bot, "db", None):
         try:
+            await run_blocking(persistence.migrate_legacy_sqlite_db)
             db_path = str(persistence.STATE_DIR / "mafiabot.db")
-            bot.db = Database(db_path)  # type: ignore[attr-defined]
-            await run_blocking(bot.db.initialize)  # type: ignore[attr-defined]
+            database = Database(db_path)
+            await run_blocking(database.initialize)
+            bot.db = database  # type: ignore[attr-defined]
         except Exception:
             logging.exception("Failed to initialize SQLite DB (leaderboards disabled).")
             bot.db = None
@@ -656,7 +684,8 @@ async def on_ready() -> None:
         await _restore_saved_game(guild)
     except (OSError, discord.HTTPException):
         logging.exception('Saved game recovery pending; retaining the snapshot.')
-        bot.gameplay_controller.start_job((ALLOWED_GUILD_ID, 'restore', 'current'), lambda: _restore_saved_game(guild))
+        bot.gameplay_controller.start_job((ALLOWED_GUILD_ID, 'restore', 'current'),
+            lambda: _restore_saved_game(bot.get_guild(ALLOWED_GUILD_ID)))
 
 
 async def _restore_saved_game(guild):
@@ -801,9 +830,13 @@ async def _restore_saved_game_locked(guild):
         _dbg(
             "H5",
             "bot.py:on_ready:restore:pre",
-            "allowed guild not connected (no restore)",
+            "allowed guild not connected (recovery pending)",
             {"allowed_guild_present": False, "allowed_guild_id": int(ALLOWED_GUILD_ID)},
         )
+        existing = active_games.get(ALLOWED_GUILD_ID)
+        if existing:
+            existing._recovering_permissions = existing.in_progress
+        raise OSError('The game server is unavailable; recovery remains pending.')
 
 _night_decorator = only_during_night_gameplay_factory(
     bot=bot,
@@ -1132,7 +1165,7 @@ async def _startgame_impl(ctx, game):
     except (OSError, discord.HTTPException):
         logging.warning('Startup delivery pending guild_id=%s', game.guild_id)
         bot.gameplay_controller.start_job((game.guild_id, 'startup', game.game_key),
-            lambda: startup.resume(game, ctx.guild, client=bot))
+            lambda: startup.resume(game, bot.get_guild(game.guild_id), client=bot))
         await ctx.send('The role assignment is saved. Server setup is incomplete and will retry; gameplay opens when it finishes.')
     logging.info('Game assigned on guild %s with %s players.', ctx.guild.id, player_count)
 

@@ -3,9 +3,11 @@ import json
 import logging
 import os
 import shutil
+import sqlite3
 import threading
+import time
 import uuid
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from copy import deepcopy
@@ -23,22 +25,25 @@ def _default_state_dir() -> Path:
 STATE_DIR = _default_state_dir()
 
 _guild_io_guard = threading.Lock()
-_guild_io_locks: Dict[int, threading.Lock] = {}
+_guild_io_locks: Dict[int, threading.RLock] = {}
+_legacy_db_migration_lock = threading.Lock()
 
 
-def _guild_io_lock(guild_id: int) -> threading.Lock:
+def _guild_io_lock(guild_id: int) -> threading.RLock:
     gid = int(guild_id)
     with _guild_io_guard:
         lock = _guild_io_locks.get(gid)
         if lock is None:
-            lock = threading.Lock()
+            # Recovery and metadata transactions call readers while already
+            # holding the same guild lock. Re-entry must remain on this thread.
+            lock = threading.RLock()
             _guild_io_locks[gid] = lock
         return lock
 
 
 @contextmanager
 def guild_persist_lock(guild_id: int) -> Iterator[None]:
-    """Serialize all guild JSON / stats mirror writes (cross-``Game`` instance)."""
+    """Serialize guild JSON reads, quarantine, and writes across ``Game`` instances."""
     lock = _guild_io_lock(guild_id)
     lock.acquire()
     try:
@@ -53,14 +58,39 @@ def sqlite_db_path() -> Path:
 
 
 def migrate_legacy_sqlite_db() -> None:
-    """One-time copy from pre-split ``bot_app/state/mafiabot.db`` if present."""
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    target = sqlite_db_path()
-    if target.exists():
+    """Snapshot legacy history, including its WAL, before creating the default DB."""
+    root = Path(__file__).resolve().parent
+    # An explicitly selected state tree is independent (including offline checks).
+    if STATE_DIR.resolve() != (root / "state").resolve():
         return
-    legacy = Path(__file__).resolve().parent / "bot_app" / "state" / "mafiabot.db"
-    if legacy.exists():
-        shutil.copy2(legacy, target)
+    target = sqlite_db_path()
+    legacy = root / "bot_app" / "state" / "mafiabot.db"
+    with _legacy_db_migration_lock:
+        try:
+            target.stat()
+        except FileNotFoundError:
+            pass
+        else:
+            return
+        try:
+            legacy.stat()
+        except FileNotFoundError:
+            return
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = _unique_tmp_for(target)
+        try:
+            # SQLite's backup reads committed WAL frames too. Copying just the
+            # main file would silently drop history after an unclean shutdown.
+            with closing(sqlite3.connect(legacy.as_uri() + "?mode=ro", uri=True)) as source:
+                with closing(sqlite3.connect(tmp)) as destination:
+                    source.backup(destination)
+            _replace_prepared_file(tmp, target)
+        except BaseException:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                logging.exception("Could not remove interrupted legacy DB snapshot %s", tmp)
+            raise
         logging.info("Migrated SQLite DB from %s to %s", legacy, target)
 
 
@@ -92,8 +122,10 @@ def backup_file(path: Path) -> Optional[Path]:
     """Best-effort timestamped backup; returns backup path or None."""
     if not path.exists():
         return None
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    backup = path.with_name(f"{path.name}.bak.{stamp}")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    # Several player actions can save within one clock tick. Every backup
+    # needs its own path, including on filesystems with coarse timestamps.
+    backup = path.with_name(f"{path.name}.bak.{stamp}.{uuid.uuid4().hex}")
     try:
         shutil.copy2(path, backup)
         prune_old_state_backups(path)
@@ -125,11 +157,49 @@ def _unique_tmp_for(path: Path) -> Path:
     return path.with_name(f"{path.name}.tmp.{nonce}")
 
 
+def _replace_prepared_file(source: Path, target: Path) -> None:
+    """Retry short Windows sharing locks without rewriting or deleting the save."""
+    for delay in (0.01, 0.03, 0.1, 0.2, 0.4, None):
+        try:
+            source.replace(target)
+            return
+        except OSError as error:
+            if delay is None or getattr(error, 'winerror', None) not in (5, 32, 33):
+                raise
+        # Async saves retain their worker and ordering/guild locks through this
+        # wait. Cancellation must drain this same prepared replacement.
+        time.sleep(delay)
+
+
 class StateReadError(OSError):
     """Recovery is unavailable; callers must not replace the existing match."""
 
 
+def _quarantine_corrupt(path: Path) -> None:
+    """Preserve damaged bytes without replacing an earlier recovery copy.
+
+    The caller holds the guild lock from the read through this rename, so a
+    newer valid save cannot be quarantined in place of the bytes just read.
+    """
+    try:
+        corrupt = path.with_name(f"{path.name}.corrupt")
+        try:
+            corrupt.stat()
+        except FileNotFoundError:
+            pass
+        else:
+            corrupt = path.with_name(f"{path.name}.corrupt.{uuid.uuid4().hex}")
+        path.rename(corrupt)
+    except OSError as error:
+        raise StateReadError("Damaged saved data could not be preserved; retry recovery before replacing it.") from error
+
+
 def load_state(guild_id: int) -> Optional[Dict[str, Any]]:
+    with guild_persist_lock(guild_id):
+        return _load_state_unlocked(guild_id)
+
+
+def _load_state_unlocked(guild_id: int) -> Optional[Dict[str, Any]]:
     path = _state_path(guild_id)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -141,15 +211,8 @@ def load_state(guild_id: int) -> Optional[Dict[str, Any]]:
     except OSError as error:
         raise StateReadError("Saved game is temporarily unreadable; retry recovery before starting another match.") from error
     except (ValueError, UnicodeError):
-        logging.exception("Failed to load persisted state from %s; treating as no state.", str(path))
-        # CR17 — quarantine corrupt file so operators can recover from .corrupt backup.
-        try:
-            corrupt = path.with_name(f"{path.name}.corrupt")
-            if corrupt.exists():
-                corrupt.unlink()
-            path.rename(corrupt)
-        except Exception:
-            logging.exception("Could not quarantine corrupt state file %s", str(path))
+        logging.exception("Invalid persisted state in %s; quarantining damaged data.", str(path))
+        _quarantine_corrupt(path)
         return None
 
 
@@ -157,15 +220,22 @@ def save_state(guild_id: int, data: Dict[str, Any]) -> None:
     with guild_persist_lock(guild_id):
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         path = _state_path(guild_id)
-        if path.exists() and data.get("in_progress"):
+        existing = _load_state_unlocked(guild_id)
+        payload = deepcopy(data)
+        # This marker belongs to the recovery file, not to a detached Game
+        # snapshot. Preserve additions made after that snapshot was prepared.
+        pending = existing.get("_pending_endgame") if existing else None
+        if isinstance(pending, dict) and pending.get("outcome"):
+            payload["_pending_endgame"] = deepcopy(pending)
+        if path.exists() and payload.get("in_progress"):
             backup_file(path)
         tmp = _unique_tmp_for(path)
         try:
             tmp.write_text(
-                json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True),
+                json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
                 encoding="utf-8",
             )
-            tmp.replace(path)
+            _replace_prepared_file(tmp, path)
         except Exception:
             try:
                 tmp.unlink(missing_ok=True)  # type: ignore[call-arg]
@@ -190,15 +260,9 @@ def _delete_state_unlocked(guild_id: int) -> None:
 def embed_pending_endgame_in_game_state(guild_id: int, pending: Dict[str, Any]) -> None:
     """Last-resort pending marker when stats meta and fallback file writes both fail."""
     with guild_persist_lock(guild_id):
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
         path = _state_path(guild_id)
-        data: Dict[str, Any] = {}
-        if path.is_file():
-            try:
-                loaded = json.loads(path.read_text(encoding="utf-8"))
-                if isinstance(loaded, dict):
-                    data = loaded
-            except Exception:
-                logging.exception("Failed to read game state for inline pending guild_id=%s", guild_id)
+        data = _load_state_unlocked(guild_id) or {}
         data["_pending_endgame"] = dict(pending)
         tmp = _unique_tmp_for(path)
         try:
@@ -206,7 +270,7 @@ def embed_pending_endgame_in_game_state(guild_id: int, pending: Dict[str, Any]) 
                 json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True),
                 encoding="utf-8",
             )
-            tmp.replace(path)
+            _replace_prepared_file(tmp, path)
         except Exception:
             try:
                 tmp.unlink(missing_ok=True)  # type: ignore[call-arg]
@@ -217,13 +281,8 @@ def embed_pending_endgame_in_game_state(guild_id: int, pending: Dict[str, Any]) 
 
 def _clear_inline_pending_endgame_unlocked(guild_id: int) -> None:
     path = _state_path(guild_id)
-    if not path.is_file():
-        return
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return
-    if not isinstance(data, dict) or "_pending_endgame" not in data:
+    data = _load_state_unlocked(guild_id)
+    if not data or "_pending_endgame" not in data:
         return
     data.pop("_pending_endgame", None)
     tmp = _unique_tmp_for(path)
@@ -232,7 +291,7 @@ def _clear_inline_pending_endgame_unlocked(guild_id: int) -> None:
             json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True),
             encoding="utf-8",
         )
-        tmp.replace(path)
+        _replace_prepared_file(tmp, path)
     except Exception:
         try:
             tmp.unlink(missing_ok=True)  # type: ignore[call-arg]
@@ -285,7 +344,7 @@ def save_pending_endgame_fallback(guild_id: int, pending: Dict[str, Any]) -> Non
         tmp = _unique_tmp_for(path)
         try:
             tmp.write_text(json.dumps(pending, ensure_ascii=False, indent=2), encoding="utf-8")
-            tmp.replace(path)
+            _replace_prepared_file(tmp, path)
         except Exception:
             try:
                 tmp.unlink(missing_ok=True)  # type: ignore[call-arg]
@@ -295,13 +354,20 @@ def save_pending_endgame_fallback(guild_id: int, pending: Dict[str, Any]) -> Non
 
 
 def load_pending_endgame_fallback(guild_id: int) -> Optional[Dict[str, Any]]:
+    with guild_persist_lock(guild_id):
+        return _load_pending_endgame_fallback_unlocked(guild_id)
+
+
+def _load_pending_endgame_fallback_unlocked(guild_id: int) -> Optional[Dict[str, Any]]:
     path = _pending_endgame_fallback_path(guild_id)
-    if not path.is_file():
-        return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else None
-    except Exception:
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise StateReadError("Pending endgame recovery is temporarily unreadable; retry before starting another match.") from error
+    except (ValueError, UnicodeError):
         logging.exception("Failed to load pending_endgame fallback guild_id=%s", guild_id)
         return None
 
@@ -335,20 +401,24 @@ def save_stats_meta(guild_id: int, meta: Dict[str, Any]) -> None:
 
 
 def load_stats(guild_id: int) -> Optional[Dict[str, Any]]:
+    with guild_persist_lock(guild_id):
+        return _load_stats_unlocked(guild_id)
+
+
+def _load_stats_unlocked(guild_id: int) -> Optional[Dict[str, Any]]:
     path = _stats_path(guild_id)
-    if not path.exists():
-        return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        logging.exception("Failed to load stats from %s; treating as no stats.", str(path))
-        try:
-            corrupt = path.with_name(f"{path.name}.corrupt")
-            if corrupt.exists():
-                corrupt.unlink()
-            path.rename(corrupt)
-        except Exception:
-            logging.exception("Could not quarantine corrupt stats file %s", str(path))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("Statistics snapshot must be an object")
+        return data
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise StateReadError("Saved statistics are temporarily unreadable; retry recovery before changing them.") from error
+    except (ValueError, UnicodeError):
+        logging.exception("Invalid statistics in %s; quarantining damaged data.", str(path))
+        _quarantine_corrupt(path)
         return None
 
 
@@ -361,7 +431,7 @@ def _save_stats_unlocked(guild_id: int, data: Dict[str, Any]) -> None:
             json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True),
             encoding="utf-8",
         )
-        tmp.replace(path)
+        _replace_prepared_file(tmp, path)
     except Exception:
         try:
             tmp.unlink(missing_ok=True)  # type: ignore[call-arg]

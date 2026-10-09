@@ -19,6 +19,7 @@ def apply_death(game, player_id: int, cause: str, *, voters=(), custom_message=N
         "is_hidden": bool(state.get("is_hidden_by_gravedigger", False)),
         "will": str(state.get("will", "") or ""), "custom_message": custom_message,
         "voters": list(voters), "announcement_id": None, "delivered": False, "converted": [],
+        "notice_delivered_ids": [],
         "notice_id": hashlib.sha256(f"{game.game_key}:{player_id}".encode()).hexdigest()[:16],
     }
     game.living_players = [p for p in game.living_players if p.id != player_id]

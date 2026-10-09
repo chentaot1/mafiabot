@@ -28,12 +28,22 @@ async def send_to_player_private_channel(
     *,
     log_context: str = "player private channel",
 ) -> bool:
-    """Best-effort post to the player's mapped channel. Returns True if sent."""
+    """Best-effort post only after verifying the mapped channel is private."""
     ch_id = private_text_channel_id_for_user(user_id)
     if ch_id is None:
         return False
     ch = guild.get_channel(ch_id)
     if not isinstance(ch, discord.TextChannel):
+        return False
+    from gameplay.controller import channel_is_private
+    try:
+        if not guild.chunked:
+            await guild.chunk(cache=True)
+        private = guild.chunked and channel_is_private(ch, guild, int(user_id))
+    except discord.HTTPException:
+        private = False
+    if not private:
+        logging.warning("%s: privacy unavailable guild_id=%s channel_id=%s", log_context, guild.id, ch_id)
         return False
     me = guild.me
     if me is not None:

@@ -35,6 +35,9 @@ def channel_is_private(channel, guild, uid):
         if isinstance(target, discord.Role):
             if target.id != GAME_OVERSEER_ROLE_ID and not target.permissions.administrator:
                 return False
+        elif isinstance(target, discord.Object):
+            # Missing members/roles have no verifiable staff or bot identity.
+            return False
         elif target.id != uid and not getattr(target, "bot", False):
             if not (target.guild_permissions.administrator or any(r.id == GAME_OVERSEER_ROLE_ID for r in target.roles)):
                 return False
@@ -132,7 +135,9 @@ class Controller:
         async with lock:
             from .lifecycle import message_lock
             async with message_lock(game.guild_id):
-                return await self._send_panel(game, uid, expected=expected, phase=phase)
+                # Drain the request and its saved reference before releasing
+                # the match boundary, even when shutdown cancels this job.
+                return await finish_pending(self._send_panel(game, uid, expected=expected, phase=phase))
 
     async def _send_panel(self, game, uid, *, expected, phase):
         st.require_current(game, phase=phase, expected=expected)
@@ -144,9 +149,9 @@ class Controller:
         st.require_current(game, phase=phase, expected=expected)
         view = self.panel_for(game, uid, persistent=True, expected=expected, regular=True)
         if message:
-            await finish_pending(message.edit(view=view, allowed_mentions=NO_MENTIONS))
+            await message.edit(view=view, allowed_mentions=NO_MENTIONS)
         else:
-            message = await finish_pending(destination.send(view=view, allowed_mentions=NO_MENTIONS))
+            message = await destination.send(view=view, allowed_mentions=NO_MENTIONS)
             def save_ref():
                 st.require_current(game, phase=phase, expected=expected)
                 game.gameplay["panels"][str(uid)] = {"channel_id": destination.id, "message_id": message.id}
@@ -154,27 +159,42 @@ class Controller:
         self.bot.add_view(view, message_id=message.id)
         return message
 
+    def retry_panel(self, game, uid, *, expected, phase):
+        async def deliver():
+            try:
+                await self.send_panel(game, uid, expected=expected, phase=phase)
+            except discord.Forbidden:
+                logging.warning("Private panel blocked for player %s; /actions can reopen it.", uid)
+        return self.start_job((game.guild_id, 'panel', uid, expected, phase), deliver)
+
     async def send_day_panels(self, game):
-        st.require_current(game, phase='day')
+        expected = st.identity(game)
+        st.require_current(game, phase='day', expected=expected)
         # Deputies receive their day controls automatically; reopened report/status
         # panels are restored on reconnect without bulk delivery to other roles.
         owners = {p.id for p in game.living_players if game.player_roles.get(p.id) == 'Deputy' and game.day_number >= 2}
         owners.update(int(uid) for uid in game.gameplay['panels'] if str(uid).isdigit())
         for uid in owners:
             try:
-                await self.send_panel(game, uid)
-            except (discord.HTTPException, st.Rejected):
+                await self.send_panel(game, uid, expected=expected, phase='day')
+            except (discord.HTTPException, st.Rejected) as error:
+                if isinstance(error, discord.HTTPException) and not isinstance(error, discord.Forbidden):
+                    self.retry_panel(game, uid, expected=expected, phase='day')
                 logging.warning('Private day panel unavailable for player %s; /actions can reopen it.', uid)
 
     async def send_night_panels(self, game):
+        expected = st.identity(game)
+        st.require_current(game, phase='night', expected=expected)
         for member in list(game.players):
             state=game.role_states.get(member.id,{})
             if member.id not in {p.id for p in game.living_players} and not (state.get('can_haunt') or state.get('haunt_target') is not None or game.player_roles.get(member.id) == 'Guardian Angel'
                     or (str(member.id) in game.gameplay['panels'] and reports.history(game, member.id))):
                 continue
             try:
-                await self.send_panel(game, member.id)
-            except (discord.HTTPException, st.Rejected):
+                await self.send_panel(game, member.id, expected=expected, phase='night')
+            except (discord.HTTPException, st.Rejected) as error:
+                if isinstance(error, discord.HTTPException) and not isinstance(error, discord.Forbidden):
+                    self.retry_panel(game, member.id, expected=expected, phase='night')
                 # Never put role details or submitted actions in a public fallback.
                 logging.warning("Private night panel unavailable for player %s; /actions can reopen it.", member.id)
 
@@ -225,8 +245,7 @@ class Controller:
     def after_submission(self, game, actor, action):
         if str(actor) in game.gameplay['panels']:
             expected, phase = st.identity(game), game.phase
-            self.start_job((game.guild_id,'panel',actor,expected,phase),
-                lambda: self.send_panel(game,actor,expected=expected,phase=phase))
+            self.retry_panel(game, actor, expected=expected, phase=phase)
         if action.get("type") == "plunder":
             token = action["duel_token"]
             self.start_job((game.guild_id, "duel", token), lambda: self.run_duel(game, actor, token))
@@ -256,7 +275,8 @@ class Controller:
     async def duel_prompt(self, game, actor, uid, action):
         from .lifecycle import message_lock
         async with message_lock(game.guild_id):
-            return await self._duel_prompt(game, actor, uid, action)
+            # A delivered result and its receipt must survive shutdown together.
+            return await finish_pending(self._duel_prompt(game, actor, uid, action))
 
     async def _duel_prompt(self, game, actor, uid, action):
         token = action["duel_token"]
@@ -265,9 +285,9 @@ class Controller:
         message = await self.fetch_message(destination, action.get("duel_prompts", {}).get(str(uid)))
         view = DuelView(self, game, actor, uid, action)
         if message:
-            await finish_pending(message.edit(view=view, allowed_mentions=NO_MENTIONS))
+            await message.edit(view=view, allowed_mentions=NO_MENTIONS)
         else:
-            message = await finish_pending(destination.send(view=view, allowed_mentions=NO_MENTIONS))
+            message = await destination.send(view=view, allowed_mentions=NO_MENTIONS)
         def checkpoint():
             current = duels.get_duel(game, actor, token, open_only=False)
             current.setdefault("duel_prompts", {})[str(uid)] = {"channel_id": destination.id, "message_id": message.id}
@@ -303,12 +323,19 @@ class Controller:
                         except asyncio.TimeoutError:
                             pass
                         continue
+                retry_error = None
                 for uid in {actor, action["target"]}:
                     if uid not in action.get("duel_delivered", []):
                         try:
                             await self.duel_prompt(game, actor, uid, action)
-                        except (discord.HTTPException, st.Rejected):
+                        except (discord.HTTPException, st.Rejected) as error:
                             logging.warning("Duel completion delivery unavailable for player %s.", uid)
+                            if isinstance(error, discord.HTTPException) and not isinstance(error, discord.Forbidden):
+                                retry_error = error
+                if retry_error is not None:
+                    # The supervisor retries the persisted result. Successful
+                    # recipients retain their receipts and are skipped next time.
+                    raise retry_error
                 return
         finally:
             self.events.pop(key, None)

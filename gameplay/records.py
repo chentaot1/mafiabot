@@ -37,6 +37,11 @@ def load_ui(raw):
             'announced': startup.get('announced') is True,
             'mafia_announced': startup.get('mafia_announced') is True,
             'completed_players': [uid for uid in completed if integer(uid)] if isinstance(completed, list) else []}
+        receipts = startup.get('dm_receipts', {})
+        result['startup']['dm_receipts'] = {
+            str(uid): list(dict.fromkeys(kind for kind in kinds if identifier(kind)))
+            for uid, kinds in receipts.items() if str(uid).isdigit() and isinstance(kinds, list)
+        } if isinstance(receipts, dict) else {}
     duels=raw.get('duels')
     if isinstance(duels,dict):
         for key,action in duels.items():
@@ -61,6 +66,12 @@ def load_ui(raw):
             saved = deepcopy(receipt)
             for key in ('delivered', 'access_cleaned', 'notices_delivered'):
                 saved[key] = saved.get(key) is True
+            recipients = set(saved['converted'])
+            if saved['real_role'] == 'Jester' and saved['cause'] == 'lynch' and saved['voters']:
+                recipients.add(saved['player_id'])
+            completed = saved.get('notice_delivered_ids', [])
+            saved['notice_delivered_ids'] = list(dict.fromkeys(
+                uid for uid in completed if integer(uid) and uid in recipients)) if isinstance(completed, list) else []
             if not integer(saved.get('announcement_id')):
                 saved['announcement_id'] = None
             result['deaths'][str(uid)] = saved

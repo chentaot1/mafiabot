@@ -187,7 +187,7 @@ Votes, UTC deadlines, stage tokens, results, and completion receipts survive res
 
 ### Pirate duels
 
-`!plunder` opens private selection controls with a 30-second timeout. Both choices, deadlines, tokens, prompts, and results are persisted. Restart recovery resumes modern duels; incomplete legacy actions without recoverable choices/deadlines are closed rather than invented. Resolution waits for unfinished duels. Winning the choice interaction and killing the target are distinct: other abilities can prevent the final kill, and Pirate's objective requires two effective plunder kills.
+`!plunder` opens private selection controls with a 30-second timeout. Both choices, deadlines, tokens, prompts, and results are persisted. Temporary Discord failures trigger retries for undelivered results, including after the game advances to another phase, while preserving the saved choices and winner. Restart recovery resumes modern duels; incomplete legacy actions without recoverable choices/deadlines are closed rather than invented. Resolution waits for unfinished duels. Winning the choice interaction and killing the target are distinct: other abilities can prevent the final kill, and Pirate's objective requires two effective plunder kills.
 
 ## Monte Carlo balance analysis
 
@@ -269,6 +269,10 @@ Retained replay fixtures are synthetic. Some replay collections are empty and ap
 
 The five added roles now have [upgraded private controls](docs/MODERN_GAMEPLAY.md#controls-for-the-five-added-roles): Deputy day shots with a final Fire confirmation, explicit Serial Killer mode buttons, preselected Guardian Angel wards, and Seer/Psychic report cards with persistent private histories. Reopen these with `/actions` or `!actions`. Existing role rules and command syntax remain in place.
 
+Automatic day and night panels retry temporary Discord failures and reuse saved messages. Each delivery stays tied to its original phase; retries stop when that phase changes or the player blocks DMs. Players can also reopen their current controls with `/actions`.
+
+Both text prompts and modern controls verify that mapped guild channels are private before sending role details. Incomplete member caches or unresolved permission-overwrite targets cannot establish privacy: text prompts skip those channels, and modern controls fall back to DMs.
+
 Regression coverage includes database/outbox behavior, restart recovery, private-channel guards, configuration validation, and specific role interactions. Larger fuzzing and property runs are available separately; consult each script's `--help` and the [simulation guide](docs/SIMULATION.md).
 
 These checks use Discord test doubles. On October 6, 2026, the project owner waived the live-server test as a prerequisite for the Python 3.14 upgrade. A real Discord test remains available as an optional check; no live gateway test was performed.
@@ -281,11 +285,37 @@ These checks use Discord test doubles. On October 6, 2026, the project owner wai
 
 A saved startup checkpoint resumes the original role assignment after interruption. Trial and night completion records retain unfinished announcements across later phases. Access cleanup and logical verdict application continue independently of public-message failures. Phase changes, ability-use accounting, tribunal verdicts, and endgame handling have guards against repeated execution. A persisted game key also prevents repeat match/stat submissions. These mechanisms address different duplicate paths; they are not a universal transaction across Discord and local storage.
 
+Cancelling night resolution before its result is saved releases the resolving flag so the same process can retry. Once the result is saved, submissions remain closed and recovery finishes delivery without calculating the night or spending resources again.
+
+Saving an active game preserves the previous snapshot in a unique timestamped backup, including when multiple saves happen in the same clock tick. The bot keeps the latest 20 backups per guild by default; `MAFIABOT_STATE_BACKUP_MAX` adjusts that limit. Temporary read failures preserve statistics and pending endgame recovery files and defer new-game creation until they can be read again. Commands explain when to retry; malformed statistics files are quarantined for inspection.
+
+Atomic save replacement retries brief Windows sharing and access locks for less than one second, using the same prepared temporary file. The existing save remains available until replacement succeeds. Retries retain write ordering and shutdown waits for the save worker; persistent failures preserve the previous file and still surface to the caller.
+
+Damaged game and statistics saves are preserved in separate `.corrupt*` recovery copies. Reads, quarantine, and writes are serialized per guild so handling an older damaged read cannot remove a newer valid save. A failed quarantine defers recovery and keeps both the damaged file and earlier recovery copies available.
+
+If the statistics database and both pending-marker files cannot be written, the game snapshot can retain a last-resort endgame marker. Later checkpoints preserve that marker inside the same locked file write, even when the checkpoint was prepared before the marker appeared. Temporary read failures defer writes without replacing saved match data, and clearing a completed marker prevents an older game object from restoring it. Preparing a game snapshot does not read recovery files.
+
+Graceful shutdown drains private control and duel deliveries through their saved message references and completion receipts. Restart recovery can reuse those messages instead of creating duplicate controls or resending an already delivered duel result. Night feedback and report cards also finish saving their delivery progress before shutdown returns; recovery resumes with the next undelivered result and advances the phase once.
+
+Startup announcements save each successful Mafia welcome and public Game Started post before shutdown releases delivery. Recovery posts only the missing announcement and uses the current day or night when a delayed welcome follows later play. Delivery checks the current match after waiting for its lock, so an obsolete startup cannot announce a replacement game. A temporarily unavailable server keeps its announcement pending for retry.
+
+Startup and restart access recovery check configured game roles and private channels before applying permissions. Unavailable required objects keep setup pending rather than silently skipping access or certifying recovery as complete. Startup resumes the saved assignment when access is available, and a missing Mafia channel is not counted as a posted welcome.
+
+Startup and restart recovery retry temporary server and permission failures using the current Discord server cache on each attempt, including setup started by `!startgame`. A server missing from the initial connection stays pending for automatic recovery when it becomes available. Reconnects can replace cached server objects without losing the saved match or reopening controls before access is repaired.
+
+Startup saves progress for each role message and role-specific briefing, including direct delivery when the queue is unavailable. Retries and graceful shutdown resume with missing messages instead of repeating an earlier role announcement. Saved receipts also survive switching between queued and direct delivery. Blocked DMs are terminal and do not stall setup for other players; a player can still use the private role command to check their assignment.
+
+Temporary SQLite write locks and stale WAL snapshots defer database work as retryable failures. Startup keeps its saved assignment and the background job retries the queue write after contention clears. Commands explain when to retry, and slash replies remain private. SQL mistakes, permission errors, and database corruption still surface as database errors.
+
+Public death announcements also save a successful send's message ID before shutdown returns. Recovery can avoid resending the announcement even when message history is unavailable; role-access cleanup remains independent of public send failures.
+
+Jester haunt instructions and Executioner conversion notices track completion per player. Temporary Discord failures retry only missing notices, including after restart, without repeating death effects or public announcements. Blocked DMs are treated as terminal so they do not prevent completion.
+
 ### Queued role messages
 
-The SQLite DM outbox stores target users, content, deduplication keys, match identity, status, attempts, and retry timing. Role-deal messages are queued after game state is saved. The pump claims pending batches, marks delivered messages, schedules retries, and recovers entries left in a stale sending state. SQLite operations run outside the event loop and always close their connections. Messages from a superseded match are discarded, including during restart before the saved match is fully loaded. In-flight private delivery is drained before a new match starts.
+The SQLite DM outbox stores target users, content, deduplication keys, match identity, status, attempts, and retry timing. Role-deal messages are queued after game state is saved. The pump claims pending batches, marks delivered messages, schedules retries, and recovers entries left in a stale sending state. SQLite operations run outside the event loop and always close their connections. Messages from a superseded match are discarded, including during restart before the saved match is fully loaded. In-flight private delivery is drained before a new match starts. Graceful shutdown finishes both the DM send and its success receipt before stopping the pump, and returns unfinished batch claims to pending so they can resume immediately. It preserves sent/failed/superseded receipts, scheduled retry times, and claims reassigned to another worker. Temporary failures reading the saved match defer queued messages without consuming delivery attempts.
 
-This queue covers role assignment and associated startup messages. Other private feedback uses direct sends. A crash between Discord delivery and the local acknowledgement can still lead to a repeated send, so the design does not promise exactly-once delivery.
+This queue covers role assignment and associated startup messages, plus night results whose recipient could not be resolved. Queued night results retain their exact match identity, including older entries, and use stable deduplication keys across Python restarts. Their queue writes also run outside the event loop. Other private feedback uses direct sends. A crash between Discord delivery and the local acknowledgement can still lead to a repeated send, so the design does not promise exactly-once delivery.
 
 ### Connection handling
 
@@ -294,6 +324,8 @@ The bot includes a single-instance lock, gateway monitoring, reconnect handling,
 ## Player statistics and leaderboards
 
 SQLite stores matches and participant records alongside aggregate and per-role statistics. Participant records preserve starting-role information even if a player is promoted or converted, while faction outcomes and personal wins are tracked separately.
+
+Installations using the default state directory automatically migrate an older `bot_app/state/mafiabot.db` when the current database is absent. Migration includes committed journal records and publishes the snapshot only after copying finishes. A failed migration can retry on the next connection; custom state directories remain independent. Commands receive the database after schema initialization succeeds.
 
 `!stats` provides a player summary. `/leaderboard` opens selectable views for overall wins, faction wins, personal objectives, and win rate; the win-rate query applies a minimum-games threshold. The overseer can import legacy JSON statistics with `!importstats`. The default rejects any imported counter that would replace newer data, within the same SQLite transaction as the import. `!importstats force` explicitly permits an intentional replacement.
 

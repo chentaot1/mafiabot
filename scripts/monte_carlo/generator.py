@@ -236,8 +236,6 @@ def _parallel_trial_worker(work: Dict[str, Any]) -> Dict[str, Any]:
     root = str(work["root"])
     if root not in sys.path:
         sys.path.insert(0, root)
-    import game as game_module
-
     from scripts.monte_carlo import config as mc_config
     from scripts.monte_carlo.runtime import close_async_loop, configure_quiet_logging
 
@@ -245,10 +243,6 @@ def _parallel_trial_worker(work: Dict[str, Any]) -> Dict[str, Any]:
     if work.get("no_engine_invariants", False):
         mc_config.ENGINE_NIGHT_INVARIANTS = False
 
-    async def _noop_persist_flush(_self: object) -> None:
-        return
-
-    game_module.Game.persist_flush = _noop_persist_flush  # type: ignore[method-assign]
     try:
         return run_generator_weighted_trials_chunk(
             int(work["player_count"]),

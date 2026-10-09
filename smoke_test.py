@@ -4455,23 +4455,26 @@ def check_leaderboard_slash_and_db_init_exist() -> None:
     bot_tree = ast.parse(src, filename=str(BOT_PY))
     on_ready = _find_async_fn(bot_tree, "on_ready")
 
-    has_db_assign = False
-    has_db_init_call = False
-    for n in ast.walk(on_ready):
-        if isinstance(n, ast.Assign):
-            for tgt in n.targets:
-                if isinstance(tgt, ast.Attribute) and isinstance(tgt.value, ast.Name) and tgt.value.id == "bot" and tgt.attr == "db":
-                    # RHS should call Database(...)
-                    if isinstance(n.value, ast.Call) and (_dotted_name(n.value.func) or "") in {"Database", "database.Database"}:
-                        has_db_assign = True
-        if isinstance(n, ast.Call):
-            dn = _dotted_name(n.func) or ""
-            if dn.endswith("bot.db.initialize"):
-                has_db_init_call = True
-
-    assert has_db_assign, "Expected on_ready to assign bot.db = Database(...)"
-    has_db_init_call |= 'await run_blocking(bot.db.initialize)' in (ast.get_source_segment(src, on_ready) or '')
-    assert has_db_init_call, "Expected on_ready to initialize the database directly or through the worker boundary"
+    database_names = {
+        target.id
+        for node in ast.walk(on_ready) if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Call)
+        and _dotted_name(node.value.func) in {"Database", "database.Database"}
+        for target in node.targets if isinstance(target, ast.Name)
+    }
+    initialized_at = []
+    published_at = []
+    for node in ast.walk(on_ready):
+        if isinstance(node, ast.Await) and isinstance(node.value, ast.Call):
+            call = node.value
+            if _dotted_name(call.func) == "run_blocking" and call.args:
+                if _dotted_name(call.args[0]) in {f"{name}.initialize" for name in database_names}:
+                    initialized_at.append(node.lineno)
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name) and node.value.id in database_names:
+            if any(_dotted_name(target) == "bot.db" for target in node.targets):
+                published_at.append(node.lineno)
+    assert initialized_at, "Expected on_ready to initialize the database off the event loop"
+    assert published_at and min(initialized_at) < min(published_at), "Expected bot.db to become available after initialization"
 
 
 

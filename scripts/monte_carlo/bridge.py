@@ -65,6 +65,16 @@ class _FakeGuild:
         return None
 
 
+class _SimulationGame(game_module.Game):
+    """Retain engine checkpoints in memory without touching saved bot games."""
+
+    async def persist_flush(self):
+        return None
+
+    def persist_now(self):
+        return None
+
+
 def _player_to_role_state(p: Player) -> Dict[str, Any]:
     r = p.role
     st: Dict[str, Any] = {}
@@ -259,7 +269,7 @@ def build_game_from_sim(
     guild_id: int = 424242,
 ) -> Tuple[game_module.Game, _FakeGuild]:
     members = [_FakeMember(p.i) for p in players if p.i in alive]
-    g = game_module.Game(guild_id=guild_id)
+    g = _SimulationGame(guild_id=guild_id)
     g.in_progress = True
     g.phase = "night"
     g.day_number = day

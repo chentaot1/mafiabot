@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import discord
 
+from async_work import finish_pending
 from engine.night import run_night_pipeline, deliver_psychic_visions
 from . import state as st
 from .death import apply_death
@@ -57,7 +58,9 @@ class BufferedMember:
 async def begin(game, guild):
     expected = st.identity(game)
     await game.sync_living_players(guild)
+    entered = False
     def enter():
+        nonlocal entered
         st.require_current(game, phase="night", expected=expected)
         if game.resolving:
             raise st.Rejected("Resolution is already in progress.")
@@ -74,9 +77,32 @@ async def begin(game, guild):
                       "night_transport_swaps", "_transport_pairs_seen", "night_transport_dm_pairs",
                       "_effective_visit_destinations_cache"):
             setattr(working, field, deepcopy(getattr(game, field, None)))
+        entered = True
         return working
     # Resolution is calculated on an isolated model. Network feedback is buffered.
-    return expected, await st.commit(game, enter)
+    try:
+        working = await st.commit(game, enter)
+    except asyncio.CancelledError:
+        # Cancellation after the entry save drains can precede returning the
+        # working model to run(). Only the call that entered owns this flag.
+        if entered:
+            await release_unapplied(game, expected)
+        raise
+    return expected, working
+
+
+async def release_unapplied(game, expected):
+    from game import active_games
+    def release():
+        if (active_games.get(game.guild_id) is game and st.identity(game) == expected
+                and game.in_progress and not game.ending):
+            record = game.gameplay.get('resolution') or {}
+            committed = (record.get('applied') and record.get('night_token') == expected[2]
+                         and not record.get('progressed'))
+            if not committed:
+                game.resolving = False
+    await st.commit(game, release, persist=(active_games.get(game.guild_id) is game
+                    and st.identity(game) == expected and game.in_progress and not game.ending), allow_recovery=True)
 
 
 async def run(game, ctx):
@@ -120,10 +146,7 @@ async def run(game, ctx):
         await finish(game, ctx)
     finally:
         if not applied:
-            def release():
-                if st.identity(game) == expected and game.in_progress and not game.ending:
-                    game.resolving = False
-            await st.commit(game, release, persist=game.in_progress and not game.ending, allow_recovery=True)
+            await release_unapplied(game, expected)
 
 
 async def finish(game, ctx):
@@ -133,6 +156,32 @@ async def finish(game, ctx):
     lock = game.delivery_locks.setdefault(key, asyncio.Lock())
     async with lock:
         await _finish(game, ctx)
+
+
+async def _deliver_feedback(game, ctx, item, index, expected, day):
+    """Deliver one saved result and checkpoint it before cancellation returns."""
+    st.require_current(game, phase="night", expected=expected)
+    member = await game.get_member_safe(ctx.guild, item["user_id"])
+    st.require_current(game, phase="night", expected=expected)
+    if member:
+        try:
+            from game import try_get_bot
+            from . import reports
+            from .views import ReportCard, NO_MENTIONS
+            controller = getattr(try_get_bot(), 'gameplay_controller', None)
+            report = reports.for_feedback(game, item['user_id'], item['text'], day)
+            if report and controller:
+                destination = await controller.private_destination(game, item['user_id'])
+                st.require_current(game, phase="night", expected=expected)
+                await destination.send(view=ReportCard(game, report), allowed_mentions=NO_MENTIONS)
+            else:
+                await member.send(item["text"])
+        except discord.Forbidden:
+            pass
+    def delivered():
+        st.require_current(game, phase="night", expected=expected)
+        game.gameplay["resolution"]["feedback_index"] = index+1
+    await st.commit(game, delivered)
 
 
 async def _finish(game, ctx):
@@ -161,25 +210,11 @@ async def _finish(game, ctx):
     while record["feedback_index"] < len(record["feedback"]):
         index = record["feedback_index"]
         item = record["feedback"][index]
-        member = await game.get_member_safe(ctx.guild, item["user_id"])
-        if member:
-            try:
-                from game import try_get_bot
-                from . import reports
-                from .views import ReportCard, NO_MENTIONS
-                controller = getattr(try_get_bot(), 'gameplay_controller', None)
-                report = reports.for_feedback(game, item['user_id'], item['text'], record.get('day', game.day_number))
-                if report and controller:
-                    destination = await controller.private_destination(game, item['user_id'])
-                    await destination.send(view=ReportCard(game, report), allowed_mentions=NO_MENTIONS)
-                else:
-                    await member.send(item["text"])
-            except discord.Forbidden:
-                pass
-        def delivered():
-            st.require_current(game, phase="night", expected=expected)
-            game.gameplay["resolution"]["feedback_index"] = index+1
-        await st.commit(game, delivered)
+        from .lifecycle import message_lock
+        async with message_lock(game.guild_id):
+            # Drain only this delivery and its receipt. Phase advancement stays
+            # in the owning task so shutdown cannot start the next day's work.
+            await finish_pending(_deliver_feedback(game, ctx, item, index, expected, record.get('day', game.day_number)))
         record = game.gameplay["resolution"]
     if await game.check_win_conditions():
         return

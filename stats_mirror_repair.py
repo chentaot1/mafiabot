@@ -23,7 +23,7 @@ def repair_guild_json_mirror_from_sqlite(db: Database, *, guild_id: int, game_ke
                 meta['last_json_game_key'] = str(game_key)
             payload['players'] = players
             payload['_meta'] = meta
-            # We already hold the non-reentrant guild lock. Reuse the atomic writer.
+            # Keep the read and atomic mirror write inside the guild transaction.
             _save_stats_unlocked(guild_id, payload)
         return True
     except Exception:

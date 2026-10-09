@@ -6,6 +6,20 @@ from config import ALL_MAFIA_ROLES, PLAYING_ROLE_ID, GAME_OVERSEER_ROLE_ID
 from game import try_get_bot
 
 
+def required_role(guild, role_id):
+    role = guild.get_role(role_id) if role_id else None
+    if role_id and role is None:
+        raise OSError('A required game role is unavailable. Retry server setup.')
+    return role
+
+
+def required_channel(guild, channel_id):
+    channel = guild.get_channel(channel_id) if channel_id else None
+    if channel_id and channel is None:
+        raise OSError('A required game channel is unavailable. Retry server setup.')
+    return channel
+
+
 def private_overwrites(guild, alive_role):
     me = getattr(guild, 'me', None)
     if me is None:
@@ -31,11 +45,16 @@ def private_overwrites(guild, alive_role):
 async def reconcile(game, guild, guard):
     # Called under the startup barrier. Gameplay controls remain unavailable
     # during recovery, and reset waits for every in-flight request to finish.
+    guard()
+    if guild is None:
+        raise OSError('The game server is unavailable.')
+    alive = required_role(guild, game.alive_role_id)
+    playing = required_role(guild, PLAYING_ROLE_ID)
+    lockdown = required_role(guild, game.lockdown_role_id)
+    channels = [(required_channel(guild, cid), mafia)
+                for cid, mafia in ((game.mafia_tc_id, True), (game.grave_tc_id, False), (game.grave_vc_id, False))]
     members = {p.id: await game.lookup_member(guild, p.id) for p in list(game.players)}
     guard()
-    alive = guild.get_role(game.alive_role_id) if game.alive_role_id else None
-    playing = guild.get_role(PLAYING_ROLE_ID)
-    lockdown = guild.get_role(game.lockdown_role_id) if game.lockdown_role_id else None
     living = {p.id for p in game.living_players}
     for uid, member in members.items():
         if member is None:
@@ -51,8 +70,7 @@ async def reconcile(game, guild, guard):
     if not any((game.mafia_tc_id, game.grave_tc_id, game.grave_vc_id)):
         return
     baseline = private_overwrites(guild, alive)
-    for cid, mafia in ((game.mafia_tc_id, True), (game.grave_tc_id, False), (game.grave_vc_id, False)):
-        channel = guild.get_channel(cid) if cid else None
+    for channel, mafia in channels:
         if channel is None:
             continue
         acl = dict(baseline)
